@@ -1,6 +1,6 @@
 use keyring::Entry;
 
-const SERVICE_NAME: &str = "desec-rs";
+const SERVICE_NAME: &str = "rssec";
 const ACCOUNT_NAME: &str = "api-token";
 const ENV_VAR_NAME: &str = "DESEC_TOKEN";
 

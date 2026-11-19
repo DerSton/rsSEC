@@ -1,8 +1,8 @@
 [package]
-name = "desec-rs"
+name = "rssec"
 version = "0.1.0"
 edition = "2024"
-description = "Minimal native desktop DNS zone editor for deSEC.io"
+description = "Unofficial native desktop DNS zone editor for deSEC.io"
 license = "GPL-3.0-only"
 repository = "https://github.com/DerSton/desec-rs"
 keywords = ["desec", "dns", "zone-editor", "egui", "desktop"]

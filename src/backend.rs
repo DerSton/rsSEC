@@ -62,7 +62,7 @@ impl BackendHandle {
         let (event_tx, event_rx) = mpsc::channel();
 
         thread::Builder::new()
-            .name("desec-backend".to_owned())
+            .name("rssec-backend".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)

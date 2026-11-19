@@ -230,7 +230,7 @@ pub fn render_about_modal(ctx: &egui::Context) -> bool {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .default_width(360.0)
         .show(ctx, |ui| {
-            ui.heading("deSEC");
+            ui.heading("rsSEC");
             let version = option_env!("APP_VERSION").unwrap_or("dev");
             ui.monospace(format!("{} {version}", env!("CARGO_PKG_NAME")));
 

@@ -15,14 +15,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bin: desec-rs
-            asset: desec-rs-linux-x86_64
+            bin: rssec
+            asset: rssec-linux-x86_64
           - os: windows-latest
-            bin: desec-rs.exe
-            asset: desec-rs-windows-x86_64.exe
+            bin: rssec.exe
+            asset: rssec-windows-x86_64.exe
           - os: macos-latest
-            bin: desec-rs
-            asset: desec-rs-macos-arm64
+            bin: rssec
+            asset: rssec-macos-arm64
 
     runs-on: ${{ matrix.os }}
     steps:
