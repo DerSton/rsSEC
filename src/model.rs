@@ -44,33 +44,6 @@ pub const RECORD_TYPES: &[&str] = &[
     "URI",
 ];
 
-/// Returns a concise BIND presentation format example for a DNS record type.
-pub fn record_type_hint(rtype: &str) -> &'static str {
-    match rtype {
-        "A" => "IPv4 address, e.g. 192.0.2.1",
-        "AAAA" => "IPv6 address, e.g. 2001:db8::1",
-        "CNAME" => "Target hostname with trailing dot, e.g. target.example.com.",
-        "MX" => "Priority and mail server with trailing dot, e.g. 10 mail.example.com.",
-        "TXT" => "Quoted text string, e.g. \"v=spf1 -all\"",
-        "NS" => "Nameserver hostname with trailing dot, e.g. ns1.example.com.",
-        "SRV" => "Priority weight port target., e.g. 10 5 5060 sip.example.com.",
-        "CAA" => "Flags tag \"value\", e.g. 0 issue \"letsencrypt.org\"",
-        "PTR" => "Target hostname with trailing dot, e.g. host.example.com.",
-        "TLSA" => "Usage selector matching-type hex-data, e.g. 3 1 1 0123abcd...",
-        "SSHFP" => "Algorithm fp-type hex-fingerprint, e.g. 4 2 0123abcd...",
-        "DS" => "Key-tag algorithm digest-type hex-digest, e.g. 12345 13 2 0123abcd...",
-        "HTTPS" | "SVCB" => "Priority target params, e.g. 1 . alpn=\"h2,h3\"",
-        "NAPTR" => "Order pref \"flags\" \"service\" \"regexp\" replacement.",
-        "URI" => "Priority weight \"target\", e.g. 10 1 \"https://example.com/\"",
-        "LOC" => "Latitude longitude altitude, e.g. 52 22 23.0 N 13 24 30.0 E 34.0m",
-        "DNAME" => "Target domain with trailing dot, e.g. other.example.com.",
-        "SPF" => "Quoted SPF text, e.g. \"v=spf1 -all\"",
-        "HINFO" => "Quoted CPU and OS, e.g. \"INTEL\" \"LINUX\"",
-        "RP" => "Mailbox and TXT domain with trailing dots, e.g. admin.example.com. .",
-        _ => "BIND presentation format (hostnames require a trailing dot)",
-    }
-}
-
 /// Summary of a domain returned by deSEC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSummary {

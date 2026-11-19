@@ -4,7 +4,9 @@ use egui_extras::{Column, TableBuilder};
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::model::{
     DiffOp, DomainSummary, RECORD_TYPES, RowStatus, RrsetData, RrsetKey, ZoneRow, ZoneState,
-    record_type_hint,
+};
+use crate::rdata::{
+    default_fields_for_type, parse_record_to_fields, schema_for_type, validate_and_format,
 };
 use crate::token::{self, TokenSource};
 
@@ -23,20 +25,24 @@ struct RecordEditorModal {
     subname: String,
     selected_type: String,
     custom_type: String,
+    last_effective_type: String,
     ttl_input: String,
-    records: Vec<String>,
+    /// Structured field values per record row (`rows[row_idx][field_idx]`).
+    rows: Vec<Vec<String>>,
     error: Option<String>,
 }
 
 impl RecordEditorModal {
     fn new_empty(default_ttl: u32) -> Self {
+        let rtype = "A".to_owned();
         Self {
             original_key: None,
             subname: String::new(),
-            selected_type: "A".to_owned(),
+            selected_type: rtype.clone(),
             custom_type: String::new(),
+            last_effective_type: rtype.clone(),
             ttl_input: default_ttl.to_string(),
-            records: vec![String::new()],
+            rows: vec![default_fields_for_type(&rtype)],
             error: None,
         }
     }
@@ -48,10 +54,15 @@ impl RecordEditorModal {
         } else {
             (CUSTOM_TYPE_SENTINEL.to_owned(), row.key.rtype.clone())
         };
-        let records = if row.display_data.records.is_empty() {
-            vec![String::new()]
+        let rtype = row.key.rtype.clone();
+        let rows = if row.display_data.records.is_empty() {
+            vec![default_fields_for_type(&rtype)]
         } else {
-            row.display_data.records.clone()
+            row.display_data
+                .records
+                .iter()
+                .map(|r| parse_record_to_fields(&rtype, r))
+                .collect()
         };
 
         Self {
@@ -59,8 +70,9 @@ impl RecordEditorModal {
             subname: row.key.subname.clone(),
             selected_type,
             custom_type,
+            last_effective_type: rtype,
             ttl_input: row.display_data.ttl.to_string(),
-            records,
+            rows,
             error: None,
         }
     }
@@ -70,6 +82,22 @@ impl RecordEditorModal {
             self.custom_type.trim().to_ascii_uppercase()
         } else {
             self.selected_type.clone()
+        }
+    }
+
+    fn sync_schema_if_type_changed(&mut self) {
+        let current = self.effective_type();
+        if current != self.last_effective_type {
+            let expected_len = schema_for_type(&current).len();
+            if self.rows.is_empty()
+                || self.rows[0].len() != expected_len
+                || (self.rows.len() == 1
+                    && self.rows[0] == default_fields_for_type(&self.last_effective_type))
+            {
+                self.rows = vec![default_fields_for_type(&current)];
+            }
+            self.last_effective_type = current;
+            self.error = None;
         }
     }
 }
@@ -119,15 +147,10 @@ impl DesecApp {
                     false,
                     Some(found.source),
                     Some("Connecting...".to_owned()),
-                    format!("Connecting with token from {source_label}..."),
+                    format!("Connecting ({source_label})..."),
                 )
             }
-            None => (
-                true,
-                None,
-                None,
-                "Enter your deSEC API token to connect.".to_owned(),
-            ),
+            None => (true, None, None, "Disconnected".to_owned()),
         };
 
         Self {
@@ -168,7 +191,7 @@ impl DesecApp {
         let minimum_ttl = self.domain_min_ttl(&domain);
         self.selected_domain = Some(domain.clone());
         self.busy_label = Some(format!("Loading {domain}..."));
-        self.status_message = format!("Fetching RRsets for {domain} from deSEC...");
+        self.status_message = format!("Fetching {domain}...");
         self.error_banner = None;
         self.backend.send(BackendCommand::FetchZone {
             domain,
@@ -192,14 +215,14 @@ impl DesecApp {
                     } else {
                         self.selected_domain = None;
                         self.zone = None;
-                        self.status_message = "Connected. No domains found in account.".to_owned();
+                        self.status_message = "No domains in account".to_owned();
                     }
                 }
 
                 BackendEvent::DomainsLoaded { domains } => {
                     self.domains = domains;
                     self.busy_label = None;
-                    self.status_message = format!("Loaded {} domains.", self.domains.len());
+                    self.status_message = format!("{} domains", self.domains.len());
                 }
 
                 BackendEvent::ZoneLoaded {
@@ -213,7 +236,7 @@ impl DesecApp {
                     self.busy_label = None;
                     self.show_review_modal = false;
                     self.editor_modal = None;
-                    self.status_message = format!("Synced {domain} ({count} RRsets).");
+                    self.status_message = format!("{domain} ({count} RRsets)");
                 }
 
                 BackendEvent::ChangesApplied {
@@ -227,15 +250,14 @@ impl DesecApp {
                     self.busy_label = None;
                     self.show_review_modal = false;
                     self.error_banner = None;
-                    self.status_message = format!(
-                        "Applied {applied_count} change(s) to {domain}. Synced ({count} RRsets)."
-                    );
+                    self.status_message =
+                        format!("Applied {applied_count} to {domain} ({count} RRsets)");
                 }
 
                 BackendEvent::Error { context, message } => {
                     self.busy_label = None;
                     self.error_banner = Some(format!("{context}: {message}"));
-                    self.status_message = format!("{context} failed.");
+                    self.status_message = format!("{context} failed");
                     if !self.connected {
                         self.show_token_modal = true;
                     }
@@ -250,7 +272,7 @@ impl DesecApp {
                 if let Some(domain) = self.selected_domain.clone() {
                     self.request_fetch_zone(domain);
                 } else if self.connected {
-                    self.busy_label = Some("Loading domains...".to_owned());
+                    self.busy_label = Some("Loading...".to_owned());
                     self.backend.send(BackendCommand::FetchDomains);
                 }
             }
@@ -271,7 +293,7 @@ impl DesecApp {
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Domain:");
+                ui.label("Zone");
 
                 let current_label = self.selected_domain.as_deref().unwrap_or("None").to_owned();
                 let mut switched_to: Option<String> = None;
@@ -279,7 +301,7 @@ impl DesecApp {
                 ui.add_enabled_ui(self.connected && !self.is_busy(), |ui| {
                     egui::ComboBox::from_id_salt("domain_selector")
                         .selected_text(&current_label)
-                        .width(220.0)
+                        .width(260.0)
                         .show_ui(ui, |ui| {
                             for domain in &self.domains {
                                 let selected =
@@ -292,7 +314,7 @@ impl DesecApp {
                             }
                         });
 
-                    if ui.button("Refresh").clicked() {
+                    if ui.button("Fetch").clicked() {
                         self.request_navigation(PendingNavigation::RefreshZone);
                     }
                 });
@@ -314,19 +336,21 @@ impl DesecApp {
                     let dirty = !summary.is_empty();
 
                     ui.add_enabled_ui(dirty && !self.is_busy(), |ui| {
-                        if ui.button("Review & Apply").clicked() {
+                        if ui.button("Apply").clicked() {
                             self.show_review_modal = true;
                         }
                         if ui.button("Discard").clicked()
                             && let Some(zone) = &mut self.zone
                         {
                             zone.discard_all();
-                            self.status_message = "Discarded all local changes.".to_owned();
                         }
                     });
 
                     if dirty {
-                        ui.label(format!("{} pending", summary.total()));
+                        ui.label(format!(
+                            "+{} ~{} -{}",
+                            summary.added, summary.modified, summary.deleted
+                        ));
                     } else if self.zone.is_some() {
                         ui.label("Synced");
                     }
@@ -339,7 +363,7 @@ impl DesecApp {
         egui::Panel::bottom("bottom_bar").show(ui, |ui| {
             if let Some(err) = self.error_banner.clone() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("Error: {err}"));
+                    ui.label(&err);
                     if ui.button("Dismiss").clicked() {
                         self.error_banner = None;
                     }
@@ -357,11 +381,7 @@ impl DesecApp {
 
                 if let Some(zone) = &self.zone {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let s = zone.summary();
-                        ui.label(format!(
-                            "Min TTL: {}s | Add: {} | Modify: {} | Delete: {}",
-                            zone.minimum_ttl, s.added, s.modified, s.deleted
-                        ));
+                        ui.label(format!("Min TTL: {}s", zone.minimum_ttl));
                     });
                 }
             });
@@ -372,7 +392,7 @@ impl DesecApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if !self.connected {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Not connected to deSEC. Configure your API token to begin.");
+                    ui.label("No active session.");
                 });
                 return;
             }
@@ -386,9 +406,9 @@ impl DesecApp {
             }) else {
                 ui.centered_and_justified(|ui| {
                     if self.is_busy() {
-                        ui.label("Loading zone from deSEC...");
+                        ui.label("Loading...");
                     } else {
-                        ui.label("Select a domain to edit its DNS zone.");
+                        ui.label("No zone selected.");
                     }
                 });
                 return;
@@ -396,19 +416,17 @@ impl DesecApp {
 
             let busy = self.is_busy();
 
-            // Toolbar
+            // Compact filter & action bar
             ui.horizontal(|ui| {
-                ui.label("Filter:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Subname, type, or value")
-                        .desired_width(220.0),
+                        .hint_text("Search")
+                        .desired_width(260.0),
                 );
 
-                ui.label("Type:");
                 egui::ComboBox::from_id_salt("type_filter")
                     .selected_text(&self.type_filter)
-                    .width(100.0)
+                    .width(120.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
                         for rtype in &available_types {
@@ -416,10 +434,10 @@ impl DesecApp {
                         }
                     });
 
-                ui.checkbox(&mut self.changes_only, "Changes only");
+                ui.checkbox(&mut self.changes_only, "Modified only");
 
                 if (!self.search_query.is_empty() || self.type_filter != "All" || self.changes_only)
-                    && ui.button("Clear filters").clicked()
+                    && ui.button("Reset").clicked()
                 {
                     self.search_query.clear();
                     self.type_filter = "All".to_owned();
@@ -428,7 +446,7 @@ impl DesecApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!busy, |ui| {
-                        if ui.button("Add Record").clicked() {
+                        if ui.button("New Record").clicked() {
                             self.editor_modal = Some(RecordEditorModal::new_empty(default_ttl));
                         }
                     });
@@ -437,7 +455,6 @@ impl DesecApp {
 
             ui.separator();
 
-            // Filtered rows
             let query = self.search_query.trim().to_ascii_lowercase();
             let rows: Vec<ZoneRow> = all_rows
                 .into_iter()
@@ -470,7 +487,7 @@ impl DesecApp {
 
             if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("No matching records.");
+                    ui.label("No records.");
                 });
                 return;
             }
@@ -486,21 +503,20 @@ impl DesecApp {
             let mut edit_row: Option<ZoneRow> = None;
             let mut delete_key: Option<RrsetKey> = None;
             let mut revert_key: Option<RrsetKey> = None;
-            let busy = self.is_busy();
 
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-                .column(Column::initial(78.0).at_least(70.0)) // Status
-                .column(Column::initial(150.0).at_least(80.0)) // Subname
-                .column(Column::initial(95.0).at_least(65.0)) // Type
-                .column(Column::initial(70.0).at_least(55.0)) // TTL
-                .column(Column::remainder().at_least(220.0)) // Records
-                .column(Column::initial(165.0).at_least(150.0)) // Actions
-                .header(24.0, |mut header| {
+                .column(Column::initial(84.0).at_least(75.0)) // State
+                .column(Column::initial(180.0).at_least(100.0)) // Subname
+                .column(Column::initial(105.0).at_least(80.0)) // Type
+                .column(Column::initial(78.0).at_least(65.0)) // TTL
+                .column(Column::remainder().at_least(280.0)) // Records
+                .column(Column::initial(175.0).at_least(165.0)) // Actions
+                .header(22.0, |mut header| {
                     header.col(|ui| {
-                        ui.strong("Status");
+                        ui.strong("State");
                     });
                     header.col(|ui| {
                         ui.strong("Subname");
@@ -597,33 +613,23 @@ impl DesecApp {
 
         let mut close_modal = false;
 
-        egui::Window::new("deSEC API Token")
+        egui::Window::new("API Token")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(420.0)
+            .default_width(360.0)
             .show(ctx, |ui| {
-                ui.label("Enter a deSEC API token to fetch and edit your DNS zones.");
-                if let Some(src) = self.token_source {
-                    let label = match src {
-                        TokenSource::Keyring => "Currently using token from system keyring.",
-                        TokenSource::Env => "Currently using token from DESEC_TOKEN.",
-                    };
-                    ui.label(label);
-                }
-
-                ui.add_space(6.0);
-                ui.label("API Token:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.token_input)
                         .password(true)
+                        .hint_text("deSEC token")
                         .desired_width(f32::INFINITY),
                 );
                 let enter_pressed =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                ui.checkbox(&mut self.save_token_to_keyring, "Save to system keyring");
-                ui.add_space(8.0);
+                ui.checkbox(&mut self.save_token_to_keyring, "Save to keyring");
+                ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
                     let can_connect = !self.token_input.trim().is_empty() && !self.is_busy();
@@ -642,19 +648,17 @@ impl DesecApp {
                             }
                         }
                         self.busy_label = Some("Connecting...".to_owned());
-                        self.status_message = "Connecting to deSEC...".to_owned();
                         self.backend
                             .send(BackendCommand::Connect { token: token_val });
                     }
 
-                    if ui.button("Clear saved token").clicked() {
+                    if ui.button("Clear Keyring").clicked() {
                         match token::delete_token() {
                             Ok(()) => {
                                 if self.token_source == Some(TokenSource::Keyring) {
                                     self.token_source = None;
                                 }
-                                self.status_message =
-                                    "Cleared saved token from system keyring.".to_owned();
+                                self.status_message = "Cleared saved token".to_owned();
                             }
                             Err(err) => {
                                 self.error_banner = Some(err);
@@ -662,7 +666,7 @@ impl DesecApp {
                         }
                     }
 
-                    if self.connected && ui.button("Cancel").clicked() {
+                    if self.connected && ui.button("Close").clicked() {
                         close_modal = true;
                     }
                 });
@@ -683,117 +687,157 @@ impl DesecApp {
         let title = if modal.original_key.is_some() {
             "Edit Record"
         } else {
-            "Add Record"
+            "New Record"
         };
 
         let mut keep_open = true;
         let mut save_requested = false;
 
+        modal.sync_schema_if_type_changed();
+
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(520.0)
+            .default_width(760.0)
+            .min_width(640.0)
             .show(ctx, |ui| {
-                egui::Grid::new("record_editor_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Subname:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut modal.subname)
-                                .hint_text("Empty or @ for apex")
-                                .desired_width(340.0),
-                        );
-                        ui.end_row();
+                // Top row: Subname, Type, and TTL
+                ui.horizontal(|ui| {
+                    ui.label("Subname");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.subname)
+                            .hint_text("@")
+                            .desired_width(240.0),
+                    );
 
-                        ui.label("Type:");
-                        ui.horizontal(|ui| {
-                            let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                                "Other (custom)"
-                            } else {
-                                &modal.selected_type
-                            };
-                            egui::ComboBox::from_id_salt("editor_record_type")
-                                .selected_text(selected_display)
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    for &rt in RECORD_TYPES {
-                                        ui.selectable_value(
-                                            &mut modal.selected_type,
-                                            rt.to_owned(),
-                                            rt,
-                                        );
-                                    }
-                                    ui.separator();
-                                    ui.selectable_value(
-                                        &mut modal.selected_type,
-                                        CUSTOM_TYPE_SENTINEL.to_owned(),
-                                        "Other (custom)",
-                                    );
-                                });
-
-                            if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut modal.custom_type)
-                                        .hint_text("e.g. TYPE65")
-                                        .desired_width(140.0),
-                                );
+                    ui.add_space(8.0);
+                    ui.label("Type");
+                    let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                        "Other"
+                    } else {
+                        &modal.selected_type
+                    };
+                    egui::ComboBox::from_id_salt("editor_record_type")
+                        .selected_text(selected_display)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for &rt in RECORD_TYPES {
+                                ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
                             }
-                        });
-                        ui.end_row();
-
-                        ui.label("TTL (seconds):");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut modal.ttl_input)
-                                    .desired_width(120.0),
+                            ui.separator();
+                            ui.selectable_value(
+                                &mut modal.selected_type,
+                                CUSTOM_TYPE_SENTINEL.to_owned(),
+                                "Other",
                             );
-                            ui.label(format!("Minimum: {min_ttl}s"));
                         });
-                        ui.end_row();
-                    });
 
-                ui.add_space(8.0);
-                ui.label("Records:");
+                    if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut modal.custom_type)
+                                .hint_text("TYPE")
+                                .desired_width(90.0),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label("TTL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.ttl_input)
+                            .hint_text(min_ttl.to_string())
+                            .desired_width(85.0),
+                    );
+                });
+
+                modal.sync_schema_if_type_changed();
                 let active_type = modal.effective_type();
-                ui.small(record_type_hint(&active_type));
-                ui.add_space(4.0);
+                let schema = schema_for_type(&active_type);
+
+                ui.separator();
 
                 let mut remove_idx: Option<usize> = None;
-                let can_remove = modal.records.len() > 1;
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        for (idx, rec) in modal.records.iter_mut().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(rec)
-                                        .code_editor()
-                                        .desired_width(390.0),
-                                );
-                                if can_remove && ui.button("Remove").clicked() {
-                                    remove_idx = Some(idx);
-                                }
-                            });
+                let can_remove = modal.rows.len() > 1;
+                let last_field_idx = schema.len().saturating_sub(1);
+
+                ui.push_id(&active_type, |ui| {
+                    let mut table = TableBuilder::new(ui)
+                        .striped(true)
+                        .vscroll(true)
+                        .max_scroll_height(280.0)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+
+                    for (idx, spec) in schema.iter().enumerate() {
+                        if idx == last_field_idx {
+                            table = table.column(Column::remainder().at_least(spec.width));
+                        } else {
+                            table = table
+                                .column(Column::initial(spec.width).at_least(44.0).resizable(true));
                         }
-                    });
+                    }
+                    if can_remove {
+                        table = table.column(Column::exact(68.0));
+                    }
+
+                    table
+                        .header(22.0, |mut header| {
+                            for spec in schema {
+                                header.col(|ui| {
+                                    ui.strong(spec.label);
+                                });
+                            }
+                            if can_remove {
+                                header.col(|_ui| {});
+                            }
+                        })
+                        .body(|mut body| {
+                            for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
+                                if row_fields.len() != schema.len() {
+                                    row_fields.resize(schema.len(), String::new());
+                                }
+                                body.row(28.0, |mut row| {
+                                    for (field_val, spec) in
+                                        row_fields.iter_mut().zip(schema.iter())
+                                    {
+                                        row.col(|ui| {
+                                            let w = ui.available_width().max(24.0);
+                                            ui.add_sized(
+                                                [w, 22.0],
+                                                egui::TextEdit::singleline(field_val)
+                                                    .hint_text(spec.hint)
+                                                    .code_editor(),
+                                            );
+                                        });
+                                    }
+                                    if can_remove {
+                                        row.col(|ui| {
+                                            if ui.button("Remove").clicked() {
+                                                remove_idx = Some(row_idx);
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                });
+
                 if let Some(idx) = remove_idx {
-                    modal.records.remove(idx);
+                    modal.rows.remove(idx);
                 }
 
-                if ui.button("Add value").clicked() {
-                    modal.records.push(String::new());
+                ui.add_space(4.0);
+                if ui.button("Add Row").clicked() {
+                    modal.rows.push(default_fields_for_type(&active_type));
                 }
 
                 if let Some(err) = &modal.error {
-                    ui.add_space(6.0);
-                    ui.label(format!("Error: {err}"));
+                    ui.add_space(4.0);
+                    ui.label(err);
                 }
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Save locally").clicked() {
+                    if ui.button("Save").clicked() {
                         save_requested = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -827,27 +871,33 @@ impl DesecApp {
             .ttl_input
             .trim()
             .parse()
-            .map_err(|_| "TTL must be a positive integer.".to_owned())?;
+            .map_err(|_| "Invalid TTL.".to_owned())?;
 
         let rtype = modal.effective_type();
         if rtype.is_empty() || !rtype.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err("Record type must be alphanumeric (e.g. A, TXT, MX).".to_owned());
+            return Err("Invalid record type.".to_owned());
         }
 
-        let records: Vec<String> = modal
-            .records
-            .iter()
-            .map(|r| r.trim().to_owned())
-            .filter(|r| !r.is_empty())
-            .collect();
-        if records.is_empty() {
-            return Err("Enter at least one non-empty record value.".to_owned());
+        if modal.rows.is_empty() {
+            return Err("At least one row is required.".to_owned());
+        }
+
+        let mut records = Vec::with_capacity(modal.rows.len());
+        for (idx, row_fields) in modal.rows.iter().enumerate() {
+            match validate_and_format(&rtype, row_fields) {
+                Ok(formatted) => records.push(formatted),
+                Err(err) => {
+                    if modal.rows.len() > 1 {
+                        return Err(format!("Row {}: {err}", idx + 1));
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         let new_key = RrsetKey::new(&modal.subname, rtype);
         let data = RrsetData::new(ttl, records);
         zone.upsert_local(modal.original_key.as_ref(), new_key, data)?;
-        self.status_message = "Updated local zone state (not yet applied to deSEC).".to_owned();
         Ok(())
     }
 
@@ -873,22 +923,15 @@ impl DesecApp {
         let mut close_modal = false;
         let mut apply_now = false;
 
-        egui::Window::new("Review & Apply Changes")
+        egui::Window::new(format!("Apply Changes ({})", ops.len()))
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(640.0)
-            .default_height(420.0)
+            .default_width(580.0)
+            .default_height(380.0)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "{} pending operation(s) will be sent atomically to deSEC for {}.",
-                    ops.len(),
-                    domain
-                ));
-                ui.separator();
-
                 egui::ScrollArea::vertical()
-                    .max_height(320.0)
+                    .max_height(300.0)
                     .show(ui, |ui| {
                         for op in &ops {
                             ui.group(|ui| {
@@ -901,25 +944,27 @@ impl DesecApp {
 
                                 match op {
                                     DiffOp::Create { data, .. } => {
-                                        ui.label(format!("Local (TTL {}):", data.ttl));
+                                        ui.label(format!("Local (TTL {})", data.ttl));
                                         for r in &data.records {
-                                            ui.monospace(format!("  + {r}"));
+                                            ui.monospace(format!("+ {r}"));
                                         }
                                     }
                                     DiffOp::Update { old, new, .. } => {
-                                        ui.label(format!("deSEC (TTL {}):", old.ttl));
+                                        ui.label(format!(
+                                            "deSEC (TTL {}) -> Local (TTL {})",
+                                            old.ttl, new.ttl
+                                        ));
                                         for r in &old.records {
-                                            ui.monospace(format!("  - {r}"));
+                                            ui.monospace(format!("- {r}"));
                                         }
-                                        ui.label(format!("Local (TTL {}):", new.ttl));
                                         for r in &new.records {
-                                            ui.monospace(format!("  + {r}"));
+                                            ui.monospace(format!("+ {r}"));
                                         }
                                     }
                                     DiffOp::Delete { old, .. } => {
-                                        ui.label(format!("deSEC (TTL {}):", old.ttl));
+                                        ui.label(format!("deSEC (TTL {})", old.ttl));
                                         for r in &old.records {
-                                            ui.monospace(format!("  - {r}"));
+                                            ui.monospace(format!("- {r}"));
                                         }
                                     }
                                 }
@@ -931,7 +976,7 @@ impl DesecApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!busy, |ui| {
-                        if ui.button("Apply to deSEC").clicked() {
+                        if ui.button("Execute").clicked() {
                             apply_now = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -942,8 +987,7 @@ impl DesecApp {
             });
 
         if apply_now {
-            self.busy_label = Some(format!("Applying {} change(s) to {domain}...", ops.len()));
-            self.status_message = format!("Sending bulk update to deSEC for {domain}...");
+            self.busy_label = Some(format!("Applying ({})...", ops.len()));
             self.error_banner = None;
             self.backend.send(BackendCommand::ApplyChanges {
                 domain,
@@ -963,16 +1007,14 @@ impl DesecApp {
         let mut confirm = false;
         let mut cancel = false;
 
-        egui::Window::new("Unsaved Local Changes")
+        egui::Window::new("Discard Local Changes?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(380.0)
+            .default_width(300.0)
             .show(ctx, |ui| {
-                ui.label("You have unapplied local changes. Proceeding will discard them.");
-                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Discard & Continue").clicked() {
+                    if ui.button("Discard").clicked() {
                         confirm = true;
                     }
                     if ui.button("Cancel").clicked() {

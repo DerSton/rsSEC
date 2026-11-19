@@ -1,6 +1,7 @@
 mod app;
 mod backend;
 mod model;
+mod rdata;
 mod token;
 
 use eframe::egui;
@@ -9,8 +10,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("deSec")
-            .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([760.0, 480.0]),
+            .with_inner_size([1180.0, 740.0])
+            .with_min_inner_size([860.0, 520.0]),
         ..Default::default()
     };
 

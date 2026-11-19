@@ -948,9 +948,12 @@ dependencies = [
 name = "desec-rs"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "desec",
  "eframe",
  "egui_extras",
+ "hex",
+ "ipnet",
  "keyring",
  "tokio",
 ]
