@@ -2,6 +2,11 @@
 name = "desec-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Minimal native desktop DNS zone editor for deSEC.io"
+license = "GPL-3.0-only"
+repository = "https://github.com/DerSton/desec-rs"
+keywords = ["desec", "dns", "zone-editor", "egui", "desktop"]
+categories = ["gui", "network-programming"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -11,3 +16,8 @@ hex = "0.4.3"
 ipnet = "2.12.2"
 keyring = { version = "4.2.0", features = ["apple-native-keyring-store"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
