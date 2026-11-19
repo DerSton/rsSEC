@@ -219,3 +219,39 @@ pub fn render_review_modal(ctx: &egui::Context, zone: &ZoneState, busy: bool) ->
 
     action
 }
+
+/// Returns `true` when the About modal should be closed.
+pub fn render_about_modal(ctx: &egui::Context) -> bool {
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+    egui::Window::new("About")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(360.0)
+        .show(ctx, |ui| {
+            ui.heading("deSEC");
+            let version = option_env!("APP_VERSION").unwrap_or("dev");
+            ui.monospace(format!("{} {version}", env!("CARGO_PKG_NAME")));
+
+            ui.add_space(6.0);
+            ui.label(env!("CARGO_PKG_DESCRIPTION"));
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("License:");
+                ui.monospace(env!("CARGO_PKG_LICENSE"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Repository:");
+                ui.hyperlink(env!("CARGO_PKG_REPOSITORY"));
+            });
+
+            ui.separator();
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+
+    close
+}

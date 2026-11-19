@@ -7,7 +7,8 @@ use crate::model::{DomainSummary, RrsetKey, ZoneRow, ZoneState};
 use crate::token::{self, TokenSource};
 use crate::ui::editor_modal::{EditorOutcome, RecordEditorModal, render_editor_modal};
 use crate::ui::modals::{
-    ReviewModalAction, TokenModalAction, render_review_modal, render_token_modal,
+    ReviewModalAction, TokenModalAction, render_about_modal, render_review_modal,
+    render_token_modal,
 };
 use crate::ui::theme::{color_added, color_deleted, color_modified};
 use crate::ui::zone_table::render_zone_table;
@@ -42,6 +43,7 @@ pub struct DesecApp {
 
     editor_modal: Option<RecordEditorModal>,
     show_review_modal: bool,
+    show_about_modal: bool,
     pending_navigation: Option<PendingNavigation>,
 }
 
@@ -92,6 +94,7 @@ impl DesecApp {
             bulk_ttl_input: "3600".to_owned(),
             editor_modal: None,
             show_review_modal: false,
+            show_about_modal: false,
             pending_navigation: None,
         }
     }
@@ -104,6 +107,7 @@ impl DesecApp {
         self.show_token_modal
             || self.editor_modal.is_some()
             || self.show_review_modal
+            || self.show_about_modal
             || self.pending_navigation.is_some()
     }
 
@@ -262,6 +266,12 @@ impl DesecApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!blocked, egui::Button::new("About"))
+                        .clicked()
+                    {
+                        self.show_about_modal = true;
+                    }
                     if ui
                         .add_enabled(!blocked, egui::Button::new("Token"))
                         .clicked()
@@ -611,6 +621,10 @@ impl DesecApp {
             } else if cancel {
                 self.pending_navigation = None;
             }
+        }
+
+        if self.show_about_modal && render_about_modal(ctx) {
+            self.show_about_modal = false;
         }
     }
 }
