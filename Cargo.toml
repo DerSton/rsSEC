@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Unofficial native desktop DNS zone editor for deSEC.io"
 license = "GPL-3.0-only"
-repository = "https://github.com/DerSton/desec-rs"
+repository = "https://github.com/DerSton/rsSEC"
 keywords = ["desec", "dns", "zone-editor", "egui", "desktop"]
 categories = ["gui", "network-programming"]
 
