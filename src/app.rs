@@ -1,105 +1,19 @@
-use eframe::egui;
-use egui_extras::{Column, TableBuilder};
+use eframe::egui::{self, RichText};
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
-use crate::model::{
-    DiffOp, DomainSummary, RECORD_TYPES, RowStatus, RrsetData, RrsetKey, ZoneRow, ZoneState,
-};
-use crate::rdata::{
-    default_fields_for_type, parse_record_to_fields, schema_for_type, validate_and_format,
-};
+use crate::model::{DomainSummary, ZoneRow, ZoneState};
 use crate::token::{self, TokenSource};
-
-const CUSTOM_TYPE_SENTINEL: &str = "CUSTOM";
+use crate::ui::editor_modal::{EditorOutcome, RecordEditorModal, render_editor_modal};
+use crate::ui::modals::{
+    ReviewModalAction, TokenModalAction, render_review_modal, render_token_modal,
+};
+use crate::ui::theme::{color_added, color_deleted, color_modified};
+use crate::ui::zone_table::render_zone_table;
 
 #[derive(Debug, Clone)]
 enum PendingNavigation {
     RefreshZone,
     SwitchDomain(String),
-}
-
-#[derive(Debug, Clone)]
-struct RecordEditorModal {
-    /// `None` when adding a new RRset; `Some(key)` when editing an existing one.
-    original_key: Option<RrsetKey>,
-    subname: String,
-    selected_type: String,
-    custom_type: String,
-    last_effective_type: String,
-    ttl_input: String,
-    /// Structured field values per record row (`rows[row_idx][field_idx]`).
-    rows: Vec<Vec<String>>,
-    error: Option<String>,
-}
-
-impl RecordEditorModal {
-    fn new_empty(default_ttl: u32) -> Self {
-        let rtype = "A".to_owned();
-        Self {
-            original_key: None,
-            subname: String::new(),
-            selected_type: rtype.clone(),
-            custom_type: String::new(),
-            last_effective_type: rtype.clone(),
-            ttl_input: default_ttl.to_string(),
-            rows: vec![default_fields_for_type(&rtype)],
-            error: None,
-        }
-    }
-
-    fn from_row(row: &ZoneRow) -> Self {
-        let is_known = RECORD_TYPES.contains(&row.key.rtype.as_str());
-        let (selected_type, custom_type) = if is_known {
-            (row.key.rtype.clone(), String::new())
-        } else {
-            (CUSTOM_TYPE_SENTINEL.to_owned(), row.key.rtype.clone())
-        };
-        let rtype = row.key.rtype.clone();
-        let rows = if row.display_data.records.is_empty() {
-            vec![default_fields_for_type(&rtype)]
-        } else {
-            row.display_data
-                .records
-                .iter()
-                .map(|r| parse_record_to_fields(&rtype, r))
-                .collect()
-        };
-
-        Self {
-            original_key: Some(row.key.clone()),
-            subname: row.key.subname.clone(),
-            selected_type,
-            custom_type,
-            last_effective_type: rtype,
-            ttl_input: row.display_data.ttl.to_string(),
-            rows,
-            error: None,
-        }
-    }
-
-    fn effective_type(&self) -> String {
-        if self.selected_type == CUSTOM_TYPE_SENTINEL {
-            self.custom_type.trim().to_ascii_uppercase()
-        } else {
-            self.selected_type.clone()
-        }
-    }
-
-    fn sync_schema_if_type_changed(&mut self) {
-        let current = self.effective_type();
-        if current != self.last_effective_type {
-            let expected_len = schema_for_type(&current).len();
-            if self.rows.is_empty()
-                || self.rows[0].len() != expected_len
-                || (self.rows.len() == 1
-                    && self.rows[0] == default_fields_for_type(&self.last_effective_type))
-            {
-                self.rows = vec![default_fields_for_type(&current)];
-            }
-            self.last_effective_type = current;
-            self.error = None;
-        }
-    }
 }
 
 pub struct DesecApp {
@@ -347,10 +261,27 @@ impl DesecApp {
                     });
 
                     if dirty {
-                        ui.label(format!(
-                            "+{} ~{} -{}",
-                            summary.added, summary.modified, summary.deleted
-                        ));
+                        if summary.deleted > 0 {
+                            ui.label(
+                                RichText::new(format!("-{}", summary.deleted))
+                                    .color(color_deleted(ui))
+                                    .strong(),
+                            );
+                        }
+                        if summary.modified > 0 {
+                            ui.label(
+                                RichText::new(format!("~{}", summary.modified))
+                                    .color(color_modified(ui))
+                                    .strong(),
+                            );
+                        }
+                        if summary.added > 0 {
+                            ui.label(
+                                RichText::new(format!("+{}", summary.added))
+                                    .color(color_added(ui))
+                                    .strong(),
+                            );
+                        }
                     } else if self.zone.is_some() {
                         ui.label("Synced");
                     }
@@ -363,7 +294,7 @@ impl DesecApp {
         egui::Panel::bottom("bottom_bar").show(ui, |ui| {
             if let Some(err) = self.error_banner.clone() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(&err);
+                    ui.label(RichText::new(&err).color(color_deleted(ui)));
                     if ui.button("Dismiss").clicked() {
                         self.error_banner = None;
                     }
@@ -473,10 +404,9 @@ impl DesecApp {
                             .contains(&query);
                         let type_match = row.key.rtype.to_ascii_lowercase().contains(&query);
                         let val_match = row
-                            .display_data
-                            .records
+                            .record_diffs()
                             .iter()
-                            .any(|r| r.to_ascii_lowercase().contains(&query));
+                            .any(|d| d.value.to_ascii_lowercase().contains(&query));
                         if !sub_match && !type_match && !val_match {
                             return false;
                         }
@@ -492,113 +422,17 @@ impl DesecApp {
                 return;
             }
 
-            let row_heights: Vec<f32> = rows
-                .iter()
-                .map(|r| {
-                    let lines = r.display_data.records.len().max(1) as f32;
-                    (lines * 18.0 + 10.0).max(28.0)
-                })
-                .collect();
+            let actions = render_zone_table(ui, &rows, busy);
 
-            let mut edit_row: Option<ZoneRow> = None;
-            let mut delete_key: Option<RrsetKey> = None;
-            let mut revert_key: Option<RrsetKey> = None;
-
-            TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-                .column(Column::initial(84.0).at_least(75.0)) // State
-                .column(Column::initial(180.0).at_least(100.0)) // Subname
-                .column(Column::initial(105.0).at_least(80.0)) // Type
-                .column(Column::initial(78.0).at_least(65.0)) // TTL
-                .column(Column::remainder().at_least(280.0)) // Records
-                .column(Column::initial(175.0).at_least(165.0)) // Actions
-                .header(22.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("State");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Subname");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Type");
-                    });
-                    header.col(|ui| {
-                        ui.strong("TTL");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Records");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Actions");
-                    });
-                })
-                .body(|body| {
-                    body.heterogeneous_rows(row_heights.into_iter(), |mut table_row| {
-                        let row = &rows[table_row.index()];
-
-                        table_row.col(|ui| {
-                            ui.label(row.status.label());
-                        });
-                        table_row.col(|ui| {
-                            ui.monospace(row.key.display_subname());
-                        });
-                        table_row.col(|ui| {
-                            ui.monospace(&row.key.rtype);
-                        });
-                        table_row.col(|ui| {
-                            ui.monospace(row.display_data.ttl.to_string());
-                        });
-                        table_row.col(|ui| {
-                            ui.vertical(|ui| {
-                                for rec in &row.display_data.records {
-                                    ui.monospace(rec);
-                                }
-                            });
-                        });
-                        table_row.col(|ui| {
-                            ui.add_enabled_ui(!busy, |ui| {
-                                ui.horizontal(|ui| match row.status {
-                                    RowStatus::Synced | RowStatus::Added => {
-                                        if ui.button("Edit").clicked() {
-                                            edit_row = Some(row.clone());
-                                        }
-                                        if ui.button("Delete").clicked() {
-                                            delete_key = Some(row.key.clone());
-                                        }
-                                    }
-                                    RowStatus::Modified => {
-                                        if ui.button("Edit").clicked() {
-                                            edit_row = Some(row.clone());
-                                        }
-                                        if ui.button("Delete").clicked() {
-                                            delete_key = Some(row.key.clone());
-                                        }
-                                        if ui.button("Revert").clicked() {
-                                            revert_key = Some(row.key.clone());
-                                        }
-                                    }
-                                    RowStatus::Deleted => {
-                                        if ui.button("Revert").clicked() {
-                                            revert_key = Some(row.key.clone());
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                    });
-                });
-
-            if let Some(row) = edit_row {
+            if let Some(row) = actions.edit_row {
                 self.editor_modal = Some(RecordEditorModal::from_row(&row));
             }
-            if let Some(key) = delete_key
+            if let Some(key) = actions.delete_key
                 && let Some(zone) = &mut self.zone
             {
                 zone.delete_local(&key);
             }
-            if let Some(key) = revert_key
+            if let Some(key) = actions.revert_key
                 && let Some(zone) = &mut self.zone
             {
                 zone.revert_key(&key);
@@ -606,428 +440,93 @@ impl DesecApp {
         });
     }
 
-    fn render_token_modal(&mut self, ctx: &egui::Context) {
-        if !self.show_token_modal {
-            return;
-        }
-
-        let mut close_modal = false;
-
-        egui::Window::new("API Token")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(360.0)
-            .show(ctx, |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.token_input)
-                        .password(true)
-                        .hint_text("deSEC token")
-                        .desired_width(f32::INFINITY),
-                );
-                let enter_pressed =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                ui.checkbox(&mut self.save_token_to_keyring, "Save to keyring");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    let can_connect = !self.token_input.trim().is_empty() && !self.is_busy();
-                    if ui
-                        .add_enabled(can_connect, egui::Button::new("Connect"))
-                        .clicked()
-                        || (enter_pressed && can_connect)
-                    {
-                        let token_val = self.token_input.trim().to_owned();
-                        if self.save_token_to_keyring {
-                            match token::save_token(&token_val) {
-                                Ok(()) => self.token_source = Some(TokenSource::Keyring),
-                                Err(err) => {
-                                    self.error_banner = Some(err);
-                                }
-                            }
-                        }
-                        self.busy_label = Some("Connecting...".to_owned());
-                        self.backend
-                            .send(BackendCommand::Connect { token: token_val });
-                    }
-
-                    if ui.button("Clear Keyring").clicked() {
-                        match token::delete_token() {
-                            Ok(()) => {
-                                if self.token_source == Some(TokenSource::Keyring) {
-                                    self.token_source = None;
-                                }
-                                self.status_message = "Cleared saved token".to_owned();
-                            }
-                            Err(err) => {
-                                self.error_banner = Some(err);
-                            }
-                        }
-                    }
-
-                    if self.connected && ui.button("Close").clicked() {
-                        close_modal = true;
-                    }
-                });
-            });
-
-        if close_modal {
-            self.show_token_modal = false;
-            self.token_input.clear();
-        }
-    }
-
-    fn render_editor_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.editor_modal.take() else {
-            return;
-        };
-
-        let min_ttl = self.zone.as_ref().map(|z| z.minimum_ttl).unwrap_or(3600);
-        let title = if modal.original_key.is_some() {
-            "Edit Record"
-        } else {
-            "New Record"
-        };
-
-        let mut keep_open = true;
-        let mut save_requested = false;
-
-        modal.sync_schema_if_type_changed();
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(true)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(760.0)
-            .min_width(640.0)
-            .show(ctx, |ui| {
-                // Top row: Subname, Type, and TTL
-                ui.horizontal(|ui| {
-                    ui.label("Subname");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut modal.subname)
-                            .hint_text("@")
-                            .desired_width(240.0),
-                    );
-
-                    ui.add_space(8.0);
-                    ui.label("Type");
-                    let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                        "Other"
-                    } else {
-                        &modal.selected_type
-                    };
-                    egui::ComboBox::from_id_salt("editor_record_type")
-                        .selected_text(selected_display)
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for &rt in RECORD_TYPES {
-                                ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
-                            }
-                            ui.separator();
-                            ui.selectable_value(
-                                &mut modal.selected_type,
-                                CUSTOM_TYPE_SENTINEL.to_owned(),
-                                "Other",
-                            );
-                        });
-
-                    if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut modal.custom_type)
-                                .hint_text("TYPE")
-                                .desired_width(90.0),
-                        );
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label("TTL");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut modal.ttl_input)
-                            .hint_text(min_ttl.to_string())
-                            .desired_width(85.0),
-                    );
-                });
-
-                modal.sync_schema_if_type_changed();
-                let active_type = modal.effective_type();
-                let schema = schema_for_type(&active_type);
-
-                ui.separator();
-
-                let mut remove_idx: Option<usize> = None;
-                let can_remove = modal.rows.len() > 1;
-                let last_field_idx = schema.len().saturating_sub(1);
-
-                ui.push_id(&active_type, |ui| {
-                    let mut table = TableBuilder::new(ui)
-                        .striped(true)
-                        .vscroll(true)
-                        .max_scroll_height(280.0)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-
-                    for (idx, spec) in schema.iter().enumerate() {
-                        if idx == last_field_idx {
-                            table = table.column(Column::remainder().at_least(spec.width));
-                        } else {
-                            table = table
-                                .column(Column::initial(spec.width).at_least(44.0).resizable(true));
-                        }
-                    }
-                    if can_remove {
-                        table = table.column(Column::exact(68.0));
-                    }
-
-                    table
-                        .header(22.0, |mut header| {
-                            for spec in schema {
-                                header.col(|ui| {
-                                    ui.strong(spec.label);
-                                });
-                            }
-                            if can_remove {
-                                header.col(|_ui| {});
-                            }
-                        })
-                        .body(|mut body| {
-                            for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
-                                if row_fields.len() != schema.len() {
-                                    row_fields.resize(schema.len(), String::new());
-                                }
-                                body.row(28.0, |mut row| {
-                                    for (field_val, spec) in
-                                        row_fields.iter_mut().zip(schema.iter())
-                                    {
-                                        row.col(|ui| {
-                                            let w = ui.available_width().max(24.0);
-                                            ui.add_sized(
-                                                [w, 22.0],
-                                                egui::TextEdit::singleline(field_val)
-                                                    .hint_text(spec.hint)
-                                                    .code_editor(),
-                                            );
-                                        });
-                                    }
-                                    if can_remove {
-                                        row.col(|ui| {
-                                            if ui.button("Remove").clicked() {
-                                                remove_idx = Some(row_idx);
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        });
-                });
-
-                if let Some(idx) = remove_idx {
-                    modal.rows.remove(idx);
+    fn render_modals(&mut self, ctx: &egui::Context) {
+        if self.show_token_modal {
+            let busy = self.is_busy();
+            match render_token_modal(
+                ctx,
+                &mut self.token_input,
+                &mut self.save_token_to_keyring,
+                &mut self.token_source,
+                self.connected,
+                busy,
+                &mut self.error_banner,
+            ) {
+                TokenModalAction::None => {}
+                TokenModalAction::Connect(token_val) => {
+                    self.busy_label = Some("Connecting...".to_owned());
+                    self.backend
+                        .send(BackendCommand::Connect { token: token_val });
                 }
-
-                ui.add_space(4.0);
-                if ui.button("Add Row").clicked() {
-                    modal.rows.push(default_fields_for_type(&active_type));
+                TokenModalAction::ClearedKeyring => {
+                    self.status_message = "Cleared saved token".to_owned();
                 }
-
-                if let Some(err) = &modal.error {
-                    ui.add_space(4.0);
-                    ui.label(err);
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save_requested = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep_open = false;
-                    }
-                });
-            });
-
-        if save_requested {
-            match self.apply_modal_to_local(&modal) {
-                Ok(()) => {
-                    keep_open = false;
-                }
-                Err(err) => {
-                    modal.error = Some(err);
+                TokenModalAction::Closed => {
+                    self.show_token_modal = false;
+                    self.token_input.clear();
                 }
             }
         }
 
-        if keep_open {
-            self.editor_modal = Some(modal);
-        }
-    }
-
-    fn apply_modal_to_local(&mut self, modal: &RecordEditorModal) -> Result<(), String> {
-        let Some(zone) = &mut self.zone else {
-            return Err("No zone loaded.".to_owned());
-        };
-
-        let ttl: u32 = modal
-            .ttl_input
-            .trim()
-            .parse()
-            .map_err(|_| "Invalid TTL.".to_owned())?;
-
-        let rtype = modal.effective_type();
-        if rtype.is_empty() || !rtype.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err("Invalid record type.".to_owned());
-        }
-
-        if modal.rows.is_empty() {
-            return Err("At least one row is required.".to_owned());
-        }
-
-        let mut records = Vec::with_capacity(modal.rows.len());
-        for (idx, row_fields) in modal.rows.iter().enumerate() {
-            match validate_and_format(&rtype, row_fields) {
-                Ok(formatted) => records.push(formatted),
-                Err(err) => {
-                    if modal.rows.len() > 1 {
-                        return Err(format!("Row {}: {err}", idx + 1));
-                    }
-                    return Err(err);
+        if let (Some(mut modal), Some(zone)) = (self.editor_modal.take(), self.zone.as_mut()) {
+            match render_editor_modal(ctx, &mut modal, zone) {
+                EditorOutcome::KeepOpen => {
+                    self.editor_modal = Some(modal);
                 }
+                EditorOutcome::Saved | EditorOutcome::Cancelled => {}
             }
         }
 
-        let new_key = RrsetKey::new(&modal.subname, rtype);
-        let data = RrsetData::new(ttl, records);
-        zone.upsert_local(modal.original_key.as_ref(), new_key, data)?;
-        Ok(())
-    }
-
-    fn render_review_modal(&mut self, ctx: &egui::Context) {
-        if !self.show_review_modal {
-            return;
+        if self.show_review_modal {
+            if let Some(zone) = &self.zone {
+                let domain = zone.domain.clone();
+                let minimum_ttl = zone.minimum_ttl;
+                match render_review_modal(ctx, zone, self.is_busy()) {
+                    ReviewModalAction::None => {}
+                    ReviewModalAction::Execute(ops) => {
+                        self.busy_label = Some(format!("Applying ({})...", ops.len()));
+                        self.error_banner = None;
+                        self.backend.send(BackendCommand::ApplyChanges {
+                            domain,
+                            minimum_ttl,
+                            ops,
+                        });
+                    }
+                    ReviewModalAction::Cancel => {
+                        self.show_review_modal = false;
+                    }
+                }
+            } else {
+                self.show_review_modal = false;
+            }
         }
 
-        let Some(zone) = &self.zone else {
-            self.show_review_modal = false;
-            return;
-        };
+        if let Some(nav) = self.pending_navigation.clone() {
+            let mut confirm = false;
+            let mut cancel = false;
 
-        let ops = zone.diff();
-        if ops.is_empty() {
-            self.show_review_modal = false;
-            return;
-        }
-
-        let domain = zone.domain.clone();
-        let minimum_ttl = zone.minimum_ttl;
-        let busy = self.is_busy();
-        let mut close_modal = false;
-        let mut apply_now = false;
-
-        egui::Window::new(format!("Apply Changes ({})", ops.len()))
-            .collapsible(false)
-            .resizable(true)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(580.0)
-            .default_height(380.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        for op in &ops {
-                            ui.group(|ui| {
-                                ui.strong(format!(
-                                    "{}  {}  {}",
-                                    op.kind_label(),
-                                    op.key().display_subname(),
-                                    op.key().rtype
-                                ));
-
-                                match op {
-                                    DiffOp::Create { data, .. } => {
-                                        ui.label(format!("Local (TTL {})", data.ttl));
-                                        for r in &data.records {
-                                            ui.monospace(format!("+ {r}"));
-                                        }
-                                    }
-                                    DiffOp::Update { old, new, .. } => {
-                                        ui.label(format!(
-                                            "deSEC (TTL {}) -> Local (TTL {})",
-                                            old.ttl, new.ttl
-                                        ));
-                                        for r in &old.records {
-                                            ui.monospace(format!("- {r}"));
-                                        }
-                                        for r in &new.records {
-                                            ui.monospace(format!("+ {r}"));
-                                        }
-                                    }
-                                    DiffOp::Delete { old, .. } => {
-                                        ui.label(format!("deSEC (TTL {})", old.ttl));
-                                        for r in &old.records {
-                                            ui.monospace(format!("- {r}"));
-                                        }
-                                    }
-                                }
-                            });
-                            ui.add_space(4.0);
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        if ui.button("Execute").clicked() {
-                            apply_now = true;
+            egui::Window::new("Discard Local Changes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(300.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard").clicked() {
+                            confirm = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            close_modal = true;
+                            cancel = true;
                         }
                     });
                 });
-            });
 
-        if apply_now {
-            self.busy_label = Some(format!("Applying ({})...", ops.len()));
-            self.error_banner = None;
-            self.backend.send(BackendCommand::ApplyChanges {
-                domain,
-                minimum_ttl,
-                ops,
-            });
-        } else if close_modal {
-            self.show_review_modal = false;
-        }
-    }
-
-    fn render_unsaved_guard_modal(&mut self, ctx: &egui::Context) {
-        let Some(nav) = self.pending_navigation.clone() else {
-            return;
-        };
-
-        let mut confirm = false;
-        let mut cancel = false;
-
-        egui::Window::new("Discard Local Changes?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Discard").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-
-        if confirm {
-            self.pending_navigation = None;
-            self.execute_navigation(nav);
-        } else if cancel {
-            self.pending_navigation = None;
+            if confirm {
+                self.pending_navigation = None;
+                self.execute_navigation(nav);
+            } else if cancel {
+                self.pending_navigation = None;
+            }
         }
     }
 }
@@ -1043,9 +542,6 @@ impl eframe::App for DesecApp {
         self.render_zone_view(ui);
 
         let ctx = ui.ctx().clone();
-        self.render_token_modal(&ctx);
-        self.render_editor_modal(&ctx);
-        self.render_review_modal(&ctx);
-        self.render_unsaved_guard_modal(&ctx);
+        self.render_modals(&ctx);
     }
 }

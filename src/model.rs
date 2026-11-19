@@ -87,7 +87,6 @@ impl RrsetKey {
 
 impl Ord for RrsetKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Place apex (`""`) first, then sort alphabetically by subname and record type.
         match (self.subname.is_empty(), other.subname.is_empty()) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
@@ -130,7 +129,7 @@ impl PartialEq for RrsetData {
     }
 }
 
-/// Sync state of a single row relative to the last fetched deSEC state.
+/// Sync state of a single row relative to the last fetched deSEC cloud state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowStatus {
     Synced,
@@ -154,13 +153,99 @@ impl RowStatus {
     }
 }
 
-/// A single row displayed in the zone editor table.
+/// Diff status of a single record value line inside an RRset cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueDiffKind {
+    Unchanged,
+    Added,
+    Removed,
+}
+
+/// One record value line to render in the table with its diff classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordValueDiff {
+    pub kind: ValueDiffKind,
+    pub value: String,
+}
+
+/// A single row displayed in the zone editor table, holding both cloud and local snapshots.
 #[derive(Debug, Clone)]
 pub struct ZoneRow {
     pub key: RrsetKey,
     pub status: RowStatus,
-    /// Current values to display (local state, or remote state if deleted).
-    pub display_data: RrsetData,
+    pub remote: Option<RrsetData>,
+    pub local: Option<RrsetData>,
+}
+
+impl ZoneRow {
+    /// Data used to pre-populate the editor when clicking `Edit`.
+    /// Even if a row is currently marked `Deleted`, editing it starts from its cloud values
+    /// and restores/updates it locally on save.
+    pub fn editable_data(&self) -> &RrsetData {
+        self.local
+            .as_ref()
+            .or(self.remote.as_ref())
+            .expect("row has either local or remote data")
+    }
+
+    /// True if TTL itself differs between deSEC cloud and local state.
+    pub fn ttl_changed(&self) -> bool {
+        match (&self.remote, &self.local) {
+            (Some(rem), Some(loc)) => rem.ttl != loc.ttl,
+            _ => false,
+        }
+    }
+
+    /// Computes per-value diff lines comparing cloud (`remote`) vs working (`local`) records.
+    pub fn record_diffs(&self) -> Vec<RecordValueDiff> {
+        match (&self.remote, &self.local) {
+            (None, Some(loc)) => loc
+                .records
+                .iter()
+                .map(|v| RecordValueDiff {
+                    kind: ValueDiffKind::Added,
+                    value: v.clone(),
+                })
+                .collect(),
+            (Some(rem), None) => rem
+                .records
+                .iter()
+                .map(|v| RecordValueDiff {
+                    kind: ValueDiffKind::Removed,
+                    value: v.clone(),
+                })
+                .collect(),
+            (Some(rem), Some(loc)) => {
+                let rem_set: BTreeSet<&str> = rem.records.iter().map(String::as_str).collect();
+                let loc_set: BTreeSet<&str> = loc.records.iter().map(String::as_str).collect();
+
+                let mut out = Vec::new();
+                // Show removed cloud records first
+                for r in &rem.records {
+                    if !loc_set.contains(r.as_str()) {
+                        out.push(RecordValueDiff {
+                            kind: ValueDiffKind::Removed,
+                            value: r.clone(),
+                        });
+                    }
+                }
+                // Show current local records (either unchanged or newly added)
+                for l in &loc.records {
+                    let kind = if rem_set.contains(l.as_str()) {
+                        ValueDiffKind::Unchanged
+                    } else {
+                        ValueDiffKind::Added
+                    };
+                    out.push(RecordValueDiff {
+                        kind,
+                        value: l.clone(),
+                    });
+                }
+                out
+            }
+            (None, None) => Vec::new(),
+        }
+    }
 }
 
 /// One atomic operation to apply to deSEC.
@@ -238,7 +323,7 @@ impl ZoneState {
         }
     }
 
-    /// Returns all rows (union of remote and local keys) with their sync status.
+    /// Returns all rows (union of remote and local keys) live-checked against `remote`.
     pub fn rows(&self) -> Vec<ZoneRow> {
         let mut all_keys = BTreeSet::new();
         all_keys.extend(self.remote.keys().cloned());
@@ -256,18 +341,21 @@ impl ZoneState {
                     Some(ZoneRow {
                         key,
                         status,
-                        display_data: loc.clone(),
+                        remote: Some(rem.clone()),
+                        local: Some(loc.clone()),
                     })
                 }
                 (None, Some(loc)) => Some(ZoneRow {
                     key,
                     status: RowStatus::Added,
-                    display_data: loc.clone(),
+                    remote: None,
+                    local: Some(loc.clone()),
                 }),
                 (Some(rem), None) => Some(ZoneRow {
                     key,
                     status: RowStatus::Deleted,
-                    display_data: rem.clone(),
+                    remote: Some(rem.clone()),
+                    local: None,
                 }),
                 (None, None) => None,
             })
@@ -319,8 +407,8 @@ impl ZoneState {
     }
 
     /// Inserts or updates an RRset in `local`.
-    /// If `original_key` is `Some(old)` and `old != new_key`, moves the RRset to `new_key`
-    /// unless `new_key` already exists in `local`.
+    /// Note: if the resulting `new_key` and `data` exactly match `remote`, `rows()` and `diff()`
+    /// automatically treat it as `Synced` again.
     pub fn upsert_local(
         &mut self,
         original_key: Option<&RrsetKey>,
@@ -426,10 +514,59 @@ mod tests {
     }
 
     #[test]
+    fn editing_back_to_cloud_values_restores_synced_state() {
+        let mut zone = sample_zone();
+        let apex_a = RrsetKey::new("", "A");
+
+        // Change value locally -> Modified
+        zone.upsert_local(
+            Some(&apex_a),
+            apex_a.clone(),
+            RrsetData::new(7200, vec!["192.0.2.99".to_owned()]),
+        )
+        .unwrap();
+        assert!(zone.is_dirty());
+        let row = zone.rows().into_iter().find(|r| r.key == apex_a).unwrap();
+        assert_eq!(row.status, RowStatus::Modified);
+        assert!(row.ttl_changed());
+        assert_eq!(
+            row.record_diffs(),
+            vec![
+                RecordValueDiff {
+                    kind: ValueDiffKind::Removed,
+                    value: "192.0.2.1".to_owned(),
+                },
+                RecordValueDiff {
+                    kind: ValueDiffKind::Added,
+                    value: "192.0.2.99".to_owned(),
+                },
+            ]
+        );
+
+        // Edit back to original cloud TTL and IP -> automatically Synced again!
+        zone.upsert_local(
+            Some(&apex_a),
+            apex_a.clone(),
+            RrsetData::new(3600, vec!["192.0.2.1".to_owned()]),
+        )
+        .unwrap();
+        assert!(!zone.is_dirty());
+        let row = zone.rows().into_iter().find(|r| r.key == apex_a).unwrap();
+        assert_eq!(row.status, RowStatus::Synced);
+        assert!(!row.ttl_changed());
+        assert_eq!(
+            row.record_diffs(),
+            vec![RecordValueDiff {
+                kind: ValueDiffKind::Unchanged,
+                value: "192.0.2.1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn add_modify_delete_and_revert_diff_lifecycle() {
         let mut zone = sample_zone();
 
-        // Add TXT record
         zone.upsert_local(
             None,
             RrsetKey::new("_dmarc", "TXT"),
@@ -437,7 +574,6 @@ mod tests {
         )
         .unwrap();
 
-        // Modify apex A record
         let apex_a = RrsetKey::new("", "A");
         zone.upsert_local(
             Some(&apex_a),
@@ -446,7 +582,6 @@ mod tests {
         )
         .unwrap();
 
-        // Delete www AAAA record
         let www_aaaa = RrsetKey::new("www", "AAAA");
         zone.delete_local(&www_aaaa);
 
@@ -456,15 +591,12 @@ mod tests {
         assert_eq!(summary.deleted, 1);
         assert_eq!(summary.total(), 3);
 
-        // Deleted row still appears in table as Deleted
         let deleted_row = zone.rows().into_iter().find(|r| r.key == www_aaaa).unwrap();
         assert_eq!(deleted_row.status, RowStatus::Deleted);
 
-        // Revert single deleted row
         zone.revert_key(&www_aaaa);
         assert_eq!(zone.summary().deleted, 0);
 
-        // Discard everything
         zone.discard_all();
         assert!(!zone.is_dirty());
     }
@@ -504,7 +636,6 @@ mod tests {
         assert!(matches!(ops[0], DiffOp::Create { ref key, .. } if key == &renamed));
         assert!(matches!(ops[1], DiffOp::Delete { ref key, .. } if key == &old));
 
-        // Collision with existing apex A should fail
         let collision = zone.upsert_local(
             Some(&renamed),
             RrsetKey::new("", "A"),

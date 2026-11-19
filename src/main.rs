@@ -3,6 +3,7 @@ mod backend;
 mod model;
 mod rdata;
 mod token;
+mod ui;
 
 use eframe::egui;
 
