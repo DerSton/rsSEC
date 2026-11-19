@@ -58,8 +58,8 @@ pub struct BackendHandle {
 
 impl BackendHandle {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<BackendCommand>();
-        let (event_tx, event_rx) = mpsc::channel::<BackendEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
 
         thread::Builder::new()
             .name("desec-backend".to_owned())
@@ -95,69 +95,17 @@ async fn worker_loop(
 
     while let Ok(cmd) = cmd_rx.recv() {
         let event = match cmd {
-            BackendCommand::Connect { token } => match Client::new(token.trim()) {
-                Ok(new_client) => match fetch_domains(&new_client).await {
-                    Ok(domains) => {
-                        client = Some(new_client);
-                        BackendEvent::Connected { domains }
-                    }
-                    Err(err) => BackendEvent::Error {
-                        context: "Connect".to_owned(),
-                        message: format_desec_error(&err, None),
-                    },
-                },
-                Err(err) => BackendEvent::Error {
-                    context: "Connect".to_owned(),
-                    message: err.to_string(),
-                },
-            },
-
-            BackendCommand::FetchDomains => match &client {
-                Some(c) => match fetch_domains(c).await {
-                    Ok(domains) => BackendEvent::DomainsLoaded { domains },
-                    Err(err) => BackendEvent::Error {
-                        context: "Fetch domains".to_owned(),
-                        message: format_desec_error(&err, None),
-                    },
-                },
-                None => BackendEvent::Error {
-                    context: "Fetch domains".to_owned(),
-                    message: "Not connected. Configure an API token first.".to_owned(),
-                },
-            },
-
+            BackendCommand::Connect { token } => handle_connect(&mut client, &token).await,
+            BackendCommand::FetchDomains => handle_fetch_domains(client.as_ref()).await,
             BackendCommand::FetchZone {
                 domain,
                 minimum_ttl,
-            } => match &client {
-                Some(c) => match fetch_rrsets(c, &domain).await {
-                    Ok(rrsets) => BackendEvent::ZoneLoaded {
-                        domain,
-                        minimum_ttl,
-                        rrsets,
-                    },
-                    Err(err) => BackendEvent::Error {
-                        context: format!("Fetch {domain}"),
-                        message: format_desec_error(&err, None),
-                    },
-                },
-                None => BackendEvent::Error {
-                    context: format!("Fetch {domain}"),
-                    message: "Not connected. Configure an API token first.".to_owned(),
-                },
-            },
-
+            } => handle_fetch_zone(client.as_ref(), domain, minimum_ttl).await,
             BackendCommand::ApplyChanges {
                 domain,
                 minimum_ttl,
                 ops,
-            } => match &client {
-                Some(c) => apply_changes(c, domain, minimum_ttl, ops).await,
-                None => BackendEvent::Error {
-                    context: format!("Apply {domain}"),
-                    message: "Not connected. Configure an API token first.".to_owned(),
-                },
-            },
+            } => handle_apply_changes(client.as_ref(), domain, minimum_ttl, ops).await,
         };
 
         let _ = event_tx.send(event);
@@ -165,79 +113,86 @@ async fn worker_loop(
     }
 }
 
-async fn fetch_domains(client: &Client) -> Result<Vec<DomainSummary>, DesecError> {
-    let mut domains: Vec<DomainSummary> = client
-        .domains()
-        .list()
-        .all()
-        .await?
-        .into_iter()
-        .map(|d| DomainSummary {
-            name: d.name,
-            minimum_ttl: d.minimum_ttl,
-        })
-        .collect();
-    domains.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(domains)
-}
+async fn handle_connect(client_slot: &mut Option<Client>, token: &str) -> BackendEvent {
+    let new_client = match Client::new(token.trim()) {
+        Ok(c) => c,
+        Err(err) => {
+            return BackendEvent::Error {
+                context: "Connect".to_owned(),
+                message: err.to_string(),
+            };
+        }
+    };
 
-async fn fetch_rrsets(
-    client: &Client,
-    domain: &str,
-) -> Result<BTreeMap<RrsetKey, RrsetData>, DesecError> {
-    let raw = client.rrsets(domain).list().all().await?;
-    Ok(convert_rrsets(raw))
-}
-
-fn convert_rrsets(raw: Vec<Rrset>) -> BTreeMap<RrsetKey, RrsetData> {
-    let mut map = BTreeMap::new();
-    for item in raw {
-        let key = RrsetKey::new(item.subname.as_payload(), item.record_type.as_str());
-        let data = RrsetData::new(item.ttl, item.records);
-        map.insert(key, data);
+    match fetch_domains(&new_client).await {
+        Ok(domains) => {
+            *client_slot = Some(new_client);
+            BackendEvent::Connected { domains }
+        }
+        Err(err) => BackendEvent::Error {
+            context: "Connect".to_owned(),
+            message: format_desec_error(&err, None),
+        },
     }
-    map
 }
 
-async fn apply_changes(
-    client: &Client,
+async fn handle_fetch_domains(client: Option<&Client>) -> BackendEvent {
+    let Some(client) = client else {
+        return not_connected_error("Fetch domains");
+    };
+
+    match fetch_domains(client).await {
+        Ok(domains) => BackendEvent::DomainsLoaded { domains },
+        Err(err) => BackendEvent::Error {
+            context: "Fetch domains".to_owned(),
+            message: format_desec_error(&err, None),
+        },
+    }
+}
+
+async fn handle_fetch_zone(
+    client: Option<&Client>,
+    domain: String,
+    minimum_ttl: u32,
+) -> BackendEvent {
+    let Some(client) = client else {
+        return not_connected_error(&format!("Fetch {domain}"));
+    };
+
+    match fetch_rrsets(client, &domain).await {
+        Ok(rrsets) => BackendEvent::ZoneLoaded {
+            domain,
+            minimum_ttl,
+            rrsets,
+        },
+        Err(err) => BackendEvent::Error {
+            context: format!("Fetch {domain}"),
+            message: format_desec_error(&err, None),
+        },
+    }
+}
+
+async fn handle_apply_changes(
+    client: Option<&Client>,
     domain: String,
     minimum_ttl: u32,
     ops: Vec<DiffOp>,
 ) -> BackendEvent {
+    let Some(client) = client else {
+        return not_connected_error(&format!("Apply {domain}"));
+    };
+
     let mut patches = Vec::with_capacity(ops.len());
-
     for op in &ops {
-        let key = op.key();
-        let subname = match Subname::new(&key.subname) {
-            Ok(s) => s,
-            Err(err) => {
+        match build_bulk_patch(op) {
+            Ok(patch) => patches.push(patch),
+            Err(message) => {
                 return BackendEvent::Error {
                     context: format!("Apply {domain}"),
-                    message: format!("{} {}: {}", key.display_subname(), key.rtype, err),
+                    message,
                 };
             }
-        };
-        let rtype = match RecordType::from_str(&key.rtype) {
-            Ok(t) => t,
-            Err(err) => {
-                return BackendEvent::Error {
-                    context: format!("Apply {domain}"),
-                    message: format!("{} {}: {}", key.display_subname(), key.rtype, err),
-                };
-            }
-        };
-
-        let patch = match op {
-            DiffOp::Create { data, .. } => BulkPatch::new(subname, rtype)
-                .ttl(data.ttl)
-                .records(data.records.clone()),
-            DiffOp::Update { new, .. } => BulkPatch::new(subname, rtype)
-                .ttl(new.ttl)
-                .records(new.records.clone()),
-            DiffOp::Delete { .. } => BulkPatch::delete(subname, rtype),
-        };
-        patches.push(patch);
+        }
     }
 
     if let Err(err) = client.rrsets(&domain).patch_bulk(&patches).await {
@@ -265,6 +220,62 @@ async fn apply_changes(
     }
 }
 
+fn build_bulk_patch(op: &DiffOp) -> Result<BulkPatch, String> {
+    let key = op.key();
+    let subname = Subname::new(&key.subname)
+        .map_err(|err| format!("{} {}: {err}", key.display_subname(), key.rtype))?;
+    let rtype = RecordType::from_str(&key.rtype)
+        .map_err(|err| format!("{} {}: {err}", key.display_subname(), key.rtype))?;
+
+    let patch = match op {
+        DiffOp::Create { data, .. } => BulkPatch::new(subname, rtype)
+            .ttl(data.ttl)
+            .records(data.records.clone()),
+        DiffOp::Update { new, .. } => BulkPatch::new(subname, rtype)
+            .ttl(new.ttl)
+            .records(new.records.clone()),
+        DiffOp::Delete { .. } => BulkPatch::delete(subname, rtype),
+    };
+    Ok(patch)
+}
+
+fn not_connected_error(context: &str) -> BackendEvent {
+    BackendEvent::Error {
+        context: context.to_owned(),
+        message: "Not connected. Configure an API token first.".to_owned(),
+    }
+}
+
+async fn fetch_domains(client: &Client) -> Result<Vec<DomainSummary>, DesecError> {
+    let mut domains: Vec<DomainSummary> = client
+        .domains()
+        .list()
+        .all()
+        .await?
+        .into_iter()
+        .map(|d| DomainSummary {
+            name: d.name,
+            minimum_ttl: d.minimum_ttl,
+        })
+        .collect();
+    domains.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(domains)
+}
+
+async fn fetch_rrsets(
+    client: &Client,
+    domain: &str,
+) -> Result<BTreeMap<RrsetKey, RrsetData>, DesecError> {
+    let raw: Vec<Rrset> = client.rrsets(domain).list().all().await?;
+    let mut map = BTreeMap::new();
+    for item in raw {
+        let key = RrsetKey::new(item.subname.as_payload(), item.record_type.as_str());
+        let data = RrsetData::new(item.ttl, item.records);
+        map.insert(key, data);
+    }
+    Ok(map)
+}
+
 fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
     if err.is_unauthorized() {
         return "Authentication failed (HTTP 401). Check your deSEC API token.".to_owned();
@@ -283,6 +294,7 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
         );
     }
 
+    // For failed bulk writes, deSEC returns a positional error array matching `ops` by index.
     if let (Some(api_err), Some(ops)) = (err.api_error(), ops)
         && let Some(items) = api_err.bulk_items()
     {
@@ -324,14 +336,14 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
     sanitize_error_text(&err.to_string())
 }
 
-/// Strips raw HTML error pages (e.g. from nginx/proxies) down to a single clean summary line.
+// Strips raw HTML error pages (e.g. from nginx/proxies) down to a single summary line.
 fn sanitize_error_text(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.contains("<html") || trimmed.contains("<HTML") || trimmed.contains("<head>") {
-        if let Some(start) = trimmed.find("<title>").or_else(|| trimmed.find("<TITLE>"))
-            && let Some(end) = trimmed[start + 7..]
-                .find("</title>")
-                .or_else(|| trimmed[start + 7..].find("</TITLE>"))
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("<html") || lower.contains("<head>") {
+        if let Some(start) = lower.find("<title>")
+            && let Some(end) = lower[start + 7..].find("</title>")
         {
             let title = trimmed[start + 7..start + 7 + end].trim();
             if !title.is_empty() {
@@ -340,5 +352,6 @@ fn sanitize_error_text(raw: &str) -> String {
         }
         return "Server returned an HTML error page. Please try again.".to_owned();
     }
+
     trimmed.to_owned()
 }

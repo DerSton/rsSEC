@@ -1,8 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// All DNS record types supported by deSEC for manual management.
-/// Any additional/unknown record type returned by the API is also preserved.
 pub const RECORD_TYPES: &[&str] = &[
     "A",
     "AAAA",
@@ -44,15 +42,14 @@ pub const RECORD_TYPES: &[&str] = &[
     "URI",
 ];
 
-/// Summary of a domain returned by deSEC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSummary {
     pub name: String,
     pub minimum_ttl: u32,
 }
 
-/// Canonical identity of an RRset within a zone: `(subname, type)`.
-/// `subname` is stored in API payload format (`""` for the zone apex).
+/// Unique identity of an RRset within a zone: `(subname, type)`.
+/// `subname` uses the deSEC API payload format (`""` for the zone apex).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RrsetKey {
     pub subname: String,
@@ -69,13 +66,13 @@ impl RrsetKey {
             trimmed_sub.to_ascii_lowercase()
         };
         let normalized_type = rtype.into().trim().to_ascii_uppercase();
+
         Self {
             subname: normalized_sub,
             rtype: normalized_type,
         }
     }
 
-    /// Human-readable subname (`@` at the zone apex).
     pub fn display_subname(&self) -> &str {
         if self.subname.is_empty() {
             "@"
@@ -87,6 +84,7 @@ impl RrsetKey {
 
 impl Ord for RrsetKey {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Place the zone apex (`""`) first, then sort alphabetically by subname and type.
         match (self.subname.is_empty(), other.subname.is_empty()) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
@@ -104,7 +102,6 @@ impl PartialOrd for RrsetKey {
     }
 }
 
-/// Mutable payload of an RRset (TTL + record values).
 #[derive(Debug, Clone, Eq)]
 pub struct RrsetData {
     pub ttl: u32,
@@ -116,7 +113,7 @@ impl RrsetData {
         Self { ttl, records }
     }
 
-    fn normalized_records(&self) -> Vec<&str> {
+    fn sorted_records(&self) -> Vec<&str> {
         let mut sorted: Vec<&str> = self.records.iter().map(String::as_str).collect();
         sorted.sort_unstable();
         sorted
@@ -125,11 +122,10 @@ impl RrsetData {
 
 impl PartialEq for RrsetData {
     fn eq(&self, other: &Self) -> bool {
-        self.ttl == other.ttl && self.normalized_records() == other.normalized_records()
+        self.ttl == other.ttl && self.sorted_records() == other.sorted_records()
     }
 }
 
-/// Sync state of a single row relative to the last fetched deSEC cloud state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowStatus {
     Synced,
@@ -149,11 +145,10 @@ impl RowStatus {
     }
 
     pub fn is_changed(self) -> bool {
-        !matches!(self, Self::Synced)
+        self != Self::Synced
     }
 }
 
-/// Diff status of a single record value line inside an RRset cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueDiffKind {
     Unchanged,
@@ -161,14 +156,13 @@ pub enum ValueDiffKind {
     Removed,
 }
 
-/// One record value line to render in the table with its diff classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordValueDiff {
     pub kind: ValueDiffKind,
     pub value: String,
 }
 
-/// A single row displayed in the zone editor table, holding both cloud and local snapshots.
+/// A single RRset card in the zone view, holding both cloud (`remote`) and working (`local`) snapshots.
 #[derive(Debug, Clone)]
 pub struct ZoneRow {
     pub key: RrsetKey,
@@ -178,25 +172,16 @@ pub struct ZoneRow {
 }
 
 impl ZoneRow {
-    /// Data used to pre-populate the editor when clicking `Edit`.
-    /// Even if a row is currently marked `Deleted`, editing it starts from its cloud values
-    /// and restores/updates it locally on save.
+    /// Returns the data used to pre-populate the editor when clicking `Edit`.
+    /// For a row marked `Deleted`, editing starts from its cloud data and restores it on save.
     pub fn editable_data(&self) -> &RrsetData {
         self.local
             .as_ref()
             .or(self.remote.as_ref())
-            .expect("row has either local or remote data")
+            .expect("ZoneRow always has local or remote data")
     }
 
-    /// True if TTL itself differs between deSEC cloud and local state.
-    pub fn ttl_changed(&self) -> bool {
-        match (&self.remote, &self.local) {
-            (Some(rem), Some(loc)) => rem.ttl != loc.ttl,
-            _ => false,
-        }
-    }
-
-    /// Computes per-value diff lines comparing cloud (`remote`) vs working (`local`) records.
+    /// Compares individual record values between cloud (`remote`) and working (`local`) state.
     pub fn record_diffs(&self) -> Vec<RecordValueDiff> {
         match (&self.remote, &self.local) {
             (None, Some(loc)) => loc
@@ -207,6 +192,7 @@ impl ZoneRow {
                     value: v.clone(),
                 })
                 .collect(),
+
             (Some(rem), None) => rem
                 .records
                 .iter()
@@ -215,40 +201,64 @@ impl ZoneRow {
                     value: v.clone(),
                 })
                 .collect(),
+
             (Some(rem), Some(loc)) => {
                 let rem_set: BTreeSet<&str> = rem.records.iter().map(String::as_str).collect();
                 let loc_set: BTreeSet<&str> = loc.records.iter().map(String::as_str).collect();
+                let mut diffs = Vec::new();
 
-                let mut out = Vec::new();
-                // Show removed cloud records first
                 for r in &rem.records {
                     if !loc_set.contains(r.as_str()) {
-                        out.push(RecordValueDiff {
+                        diffs.push(RecordValueDiff {
                             kind: ValueDiffKind::Removed,
                             value: r.clone(),
                         });
                     }
                 }
-                // Show current local records (either unchanged or newly added)
                 for l in &loc.records {
                     let kind = if rem_set.contains(l.as_str()) {
                         ValueDiffKind::Unchanged
                     } else {
                         ValueDiffKind::Added
                     };
-                    out.push(RecordValueDiff {
+                    diffs.push(RecordValueDiff {
                         kind,
                         value: l.clone(),
                     });
                 }
-                out
+                diffs
             }
+
             (None, None) => Vec::new(),
         }
     }
+
+    pub fn matches_filter(&self, query_lower: &str, type_filter: &str, changes_only: bool) -> bool {
+        if changes_only && !self.status.is_changed() {
+            return false;
+        }
+        if type_filter != "All" && self.key.rtype != type_filter {
+            return false;
+        }
+        if query_lower.is_empty() {
+            return true;
+        }
+
+        let sub_match = self
+            .key
+            .display_subname()
+            .to_ascii_lowercase()
+            .contains(query_lower);
+        let type_match = self.key.rtype.to_ascii_lowercase().contains(query_lower);
+        let val_match = self
+            .record_diffs()
+            .iter()
+            .any(|d| d.value.to_ascii_lowercase().contains(query_lower));
+
+        sub_match || type_match || val_match
+    }
 }
 
-/// One atomic operation to apply to deSEC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffOp {
     Create {
@@ -282,7 +292,6 @@ impl DiffOp {
     }
 }
 
-/// Aggregate count of pending local changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffSummary {
     pub added: usize,
@@ -300,7 +309,7 @@ impl DiffSummary {
     }
 }
 
-/// Holds both the authoritative deSEC (remote) state and the user's local working state.
+/// Holds both the authoritative deSEC (`remote`) state and the user's `local` working state.
 #[derive(Debug, Clone)]
 pub struct ZoneState {
     pub domain: String,
@@ -323,13 +332,15 @@ impl ZoneState {
         }
     }
 
-    /// Returns all rows (union of remote and local keys) live-checked against `remote`.
-    pub fn rows(&self) -> Vec<ZoneRow> {
-        let mut all_keys = BTreeSet::new();
-        all_keys.extend(self.remote.keys().cloned());
-        all_keys.extend(self.local.keys().cloned());
+    fn all_keys(&self) -> BTreeSet<RrsetKey> {
+        let mut keys = BTreeSet::new();
+        keys.extend(self.remote.keys().cloned());
+        keys.extend(self.local.keys().cloned());
+        keys
+    }
 
-        all_keys
+    pub fn rows(&self) -> Vec<ZoneRow> {
+        self.all_keys()
             .into_iter()
             .filter_map(|key| match (self.remote.get(&key), self.local.get(&key)) {
                 (Some(rem), Some(loc)) => {
@@ -362,14 +373,9 @@ impl ZoneState {
             .collect()
     }
 
-    /// Computes the minimal ordered list of operations needed to bring deSEC to match `local`.
     pub fn diff(&self) -> Vec<DiffOp> {
         let mut ops = Vec::new();
-        let mut all_keys = BTreeSet::new();
-        all_keys.extend(self.remote.keys().cloned());
-        all_keys.extend(self.local.keys().cloned());
-
-        for key in all_keys {
+        for key in self.all_keys() {
             match (self.remote.get(&key), self.local.get(&key)) {
                 (None, Some(new)) => ops.push(DiffOp::Create {
                     key,
@@ -391,24 +397,21 @@ impl ZoneState {
     }
 
     pub fn summary(&self) -> DiffSummary {
-        let mut s = DiffSummary::default();
+        let mut summary = DiffSummary::default();
         for op in self.diff() {
             match op {
-                DiffOp::Create { .. } => s.added += 1,
-                DiffOp::Update { .. } => s.modified += 1,
-                DiffOp::Delete { .. } => s.deleted += 1,
+                DiffOp::Create { .. } => summary.added += 1,
+                DiffOp::Update { .. } => summary.modified += 1,
+                DiffOp::Delete { .. } => summary.deleted += 1,
             }
         }
-        s
+        summary
     }
 
     pub fn is_dirty(&self) -> bool {
         !self.summary().is_empty()
     }
 
-    /// Inserts or updates an RRset in `local`.
-    /// Note: if the resulting `new_key` and `data` exactly match `remote`, `rows()` and `diff()`
-    /// automatically treat it as `Synced` again.
     pub fn upsert_local(
         &mut self,
         original_key: Option<&RrsetKey>,
@@ -449,20 +452,16 @@ impl ZoneState {
         Ok(())
     }
 
-    /// Removes an RRset from `local` (marking it as Deleted if it exists on deSEC).
     pub fn delete_local(&mut self, key: &RrsetKey) {
         self.local.remove(key);
     }
 
-    /// Removes multiple RRsets from `local` in bulk.
     pub fn delete_bulk_local<'a>(&mut self, keys: impl IntoIterator<Item = &'a RrsetKey>) {
         for key in keys {
             self.local.remove(key);
         }
     }
 
-    /// Updates the TTL of multiple RRsets in `local` in bulk.
-    /// For a row currently marked as `Deleted`, restores its remote records with the new TTL.
     pub fn set_ttl_bulk<'a>(
         &mut self,
         keys: impl IntoIterator<Item = &'a RrsetKey>,
@@ -490,7 +489,6 @@ impl ZoneState {
         Ok(updated)
     }
 
-    /// Reverts a single RRset back to its deSEC remote state.
     pub fn revert_key(&mut self, key: &RrsetKey) {
         if let Some(rem) = self.remote.get(key) {
             self.local.insert(key.clone(), rem.clone());
@@ -499,25 +497,22 @@ impl ZoneState {
         }
     }
 
-    /// Reverts multiple RRsets back to their deSEC remote state in bulk.
     pub fn revert_bulk<'a>(&mut self, keys: impl IntoIterator<Item = &'a RrsetKey>) {
         for key in keys {
             self.revert_key(key);
         }
     }
 
-    /// Discards all local changes, restoring `local` to match `remote`.
     pub fn discard_all(&mut self) {
         self.local = self.remote.clone();
     }
 
-    /// Returns all record types present in this zone plus all standard deSEC types, sorted.
     pub fn available_record_types(&self) -> Vec<String> {
-        let mut set: BTreeSet<String> = RECORD_TYPES.iter().map(|s| (*s).to_owned()).collect();
+        let mut types: BTreeSet<String> = RECORD_TYPES.iter().map(|s| (*s).to_owned()).collect();
         for key in self.remote.keys().chain(self.local.keys()) {
-            set.insert(key.rtype.clone());
+            types.insert(key.rtype.clone());
         }
-        set.into_iter().collect()
+        types.into_iter().collect()
     }
 }
 
@@ -561,7 +556,6 @@ mod tests {
         let mut zone = sample_zone();
         let apex_a = RrsetKey::new("", "A");
 
-        // Change value locally -> Modified
         zone.upsert_local(
             Some(&apex_a),
             apex_a.clone(),
@@ -571,7 +565,6 @@ mod tests {
         assert!(zone.is_dirty());
         let row = zone.rows().into_iter().find(|r| r.key == apex_a).unwrap();
         assert_eq!(row.status, RowStatus::Modified);
-        assert!(row.ttl_changed());
         assert_eq!(
             row.record_diffs(),
             vec![
@@ -586,7 +579,6 @@ mod tests {
             ]
         );
 
-        // Edit back to original cloud TTL and IP -> automatically Synced again!
         zone.upsert_local(
             Some(&apex_a),
             apex_a.clone(),
@@ -596,7 +588,6 @@ mod tests {
         assert!(!zone.is_dirty());
         let row = zone.rows().into_iter().find(|r| r.key == apex_a).unwrap();
         assert_eq!(row.status, RowStatus::Synced);
-        assert!(!row.ttl_changed());
         assert_eq!(
             row.record_diffs(),
             vec![RecordValueDiff {
@@ -703,19 +694,15 @@ mod tests {
         let mut zone = sample_zone();
         let keys = vec![RrsetKey::new("", "A"), RrsetKey::new("www", "AAAA")];
 
-        // Bulk update TTL to 7200
         zone.set_ttl_bulk(&keys, 7200).unwrap();
         assert_eq!(zone.summary().modified, 2);
 
-        // Bulk update TTL back to 3600 -> automatically Synced again
         zone.set_ttl_bulk(&keys, 3600).unwrap();
         assert!(!zone.is_dirty());
 
-        // Bulk delete
         zone.delete_bulk_local(&keys);
         assert_eq!(zone.summary().deleted, 2);
 
-        // Bulk revert
         zone.revert_bulk(&keys);
         assert!(!zone.is_dirty());
     }

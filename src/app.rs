@@ -25,25 +25,21 @@ pub struct DesecApp {
     status_message: String,
     error_banner: Option<String>,
 
-    // Token dialog state
     show_token_modal: bool,
     token_input: String,
     save_token_to_keyring: bool,
     token_source: Option<TokenSource>,
 
-    // Domain & zone state
     domains: Vec<DomainSummary>,
     selected_domain: Option<String>,
     zone: Option<ZoneState>,
 
-    // Filters & bulk selection
     search_query: String,
     type_filter: String,
     changes_only: bool,
     selected_keys: BTreeSet<RrsetKey>,
     bulk_ttl_input: String,
 
-    // Modals
     editor_modal: Option<RecordEditorModal>,
     show_review_modal: bool,
     pending_navigation: Option<PendingNavigation>,
@@ -51,16 +47,15 @@ pub struct DesecApp {
 
 impl DesecApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Work around an integer underflow bug in egui/epaint 0.37.0's new IME preedit
-        // underline renderer on Wayland (`preedit_range.end.index - preedit_range.start.index`).
+        // Work around an integer underflow in egui/epaint 0.37.0's new IME preedit underline renderer.
         cc.egui_ctx.all_styles_mut(|style| {
             style.visuals.ime_composition.legacy_visuals = true;
         });
 
         let backend = BackendHandle::spawn(cc.egui_ctx.clone());
 
-        let loaded = token::load_token();
-        let (show_token_modal, token_source, busy_label, status_message) = match loaded {
+        let (show_token_modal, token_source, busy_label, status_message) = match token::load_token()
+        {
             Some(found) => {
                 backend.send(BackendCommand::Connect { token: found.token });
                 let source_label = match found.source {
@@ -352,154 +347,33 @@ impl DesecApp {
                 )
             }) else {
                 ui.centered_and_justified(|ui| {
-                    if self.is_busy() {
-                        ui.label("Loading...");
+                    let msg = if self.is_busy() {
+                        "Loading..."
                     } else {
-                        ui.label("No zone selected.");
-                    }
+                        "No zone selected."
+                    };
+                    ui.label(msg);
                 });
                 return;
             };
 
-            // Prune any selected keys that no longer exist in the current zone
             let valid_keys: BTreeSet<RrsetKey> = all_rows.iter().map(|r| r.key.clone()).collect();
             self.selected_keys.retain(|k| valid_keys.contains(k));
 
-            let busy = self.is_busy();
+            self.render_filter_bar(ui, &available_types, default_ttl);
 
-            // Compact filter & action bar
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search")
-                        .desired_width(240.0),
-                );
-
-                egui::ComboBox::from_id_salt("type_filter")
-                    .selected_text(&self.type_filter)
-                    .width(115.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
-                        for rtype in &available_types {
-                            ui.selectable_value(&mut self.type_filter, rtype.clone(), rtype);
-                        }
-                    });
-
-                ui.checkbox(&mut self.changes_only, "Modified only");
-
-                if (!self.search_query.is_empty() || self.type_filter != "All" || self.changes_only)
-                    && ui.button("Reset").clicked()
-                {
-                    self.search_query.clear();
-                    self.type_filter = "All".to_owned();
-                    self.changes_only = false;
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        if ui.button("New Record").clicked() {
-                            self.editor_modal = Some(RecordEditorModal::new_empty(default_ttl));
-                        }
-                    });
-                });
-            });
-
-            // Bulk action bar (shown whenever at least one record is selected)
             if !self.selected_keys.is_empty() {
                 ui.separator();
-                let mut trigger_bulk_ttl = false;
-                let mut trigger_bulk_delete = false;
-                let mut trigger_bulk_revert = false;
-                let mut trigger_clear_selection = false;
-
-                ui.horizontal(|ui| {
-                    ui.strong(format!("{} selected", self.selected_keys.len()));
-                    ui.separator();
-
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.label("TTL");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.bulk_ttl_input)
-                                .desired_width(78.0),
-                        );
-                        let enter =
-                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui.button("Set TTL").clicked() || enter {
-                            trigger_bulk_ttl = true;
-                        }
-
-                        ui.separator();
-                        if ui.button("Delete Selected").clicked() {
-                            trigger_bulk_delete = true;
-                        }
-                        if ui.button("Revert Selected").clicked() {
-                            trigger_bulk_revert = true;
-                        }
-                    });
-
-                    if ui.button("Clear Selection").clicked() {
-                        trigger_clear_selection = true;
-                    }
-                });
-
-                if trigger_bulk_ttl {
-                    match self.bulk_ttl_input.trim().parse::<u32>() {
-                        Ok(ttl) => {
-                            if let Some(zone) = &mut self.zone {
-                                match zone.set_ttl_bulk(&self.selected_keys, ttl) {
-                                    Ok(_) => {
-                                        self.error_banner = None;
-                                    }
-                                    Err(err) => {
-                                        self.error_banner = Some(err);
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            self.error_banner = Some("Invalid bulk TTL.".to_owned());
-                        }
-                    }
-                }
-                if trigger_bulk_delete && let Some(zone) = &mut self.zone {
-                    zone.delete_bulk_local(&self.selected_keys);
-                }
-                if trigger_bulk_revert && let Some(zone) = &mut self.zone {
-                    zone.revert_bulk(&self.selected_keys);
-                }
-                if trigger_clear_selection {
-                    self.selected_keys.clear();
-                }
+                self.render_bulk_bar(ui);
             }
 
             ui.separator();
 
-            let query = self.search_query.trim().to_ascii_lowercase();
+            let query_lower = self.search_query.trim().to_ascii_lowercase();
             let rows: Vec<ZoneRow> = all_rows
                 .into_iter()
                 .filter(|row| {
-                    if self.changes_only && !row.status.is_changed() {
-                        return false;
-                    }
-                    if self.type_filter != "All" && row.key.rtype != self.type_filter {
-                        return false;
-                    }
-                    if !query.is_empty() {
-                        let sub_match = row
-                            .key
-                            .display_subname()
-                            .to_ascii_lowercase()
-                            .contains(&query);
-                        let type_match = row.key.rtype.to_ascii_lowercase().contains(&query);
-                        let val_match = row
-                            .record_diffs()
-                            .iter()
-                            .any(|d| d.value.to_ascii_lowercase().contains(&query));
-                        if !sub_match && !type_match && !val_match {
-                            return false;
-                        }
-                    }
-                    true
+                    row.matches_filter(&query_lower, &self.type_filter, self.changes_only)
                 })
                 .collect();
 
@@ -510,6 +384,7 @@ impl DesecApp {
                 return;
             }
 
+            let busy = self.is_busy();
             let actions = render_zone_table(ui, &rows, &mut self.selected_keys, busy);
 
             if let Some(row) = actions.edit_row {
@@ -524,6 +399,100 @@ impl DesecApp {
                 && let Some(zone) = &mut self.zone
             {
                 zone.revert_key(&key);
+            }
+        });
+    }
+
+    fn render_filter_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        available_types: &[String],
+        default_ttl: u32,
+    ) {
+        let busy = self.is_busy();
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("Search")
+                    .desired_width(240.0),
+            );
+
+            egui::ComboBox::from_id_salt("type_filter")
+                .selected_text(&self.type_filter)
+                .width(115.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
+                    for rtype in available_types {
+                        ui.selectable_value(&mut self.type_filter, rtype.clone(), rtype);
+                    }
+                });
+
+            ui.checkbox(&mut self.changes_only, "Modified only");
+
+            let has_active_filter =
+                !self.search_query.is_empty() || self.type_filter != "All" || self.changes_only;
+            if has_active_filter && ui.button("Reset").clicked() {
+                self.search_query.clear();
+                self.type_filter = "All".to_owned();
+                self.changes_only = false;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui.button("New Record").clicked() {
+                        self.editor_modal = Some(RecordEditorModal::new_empty(default_ttl));
+                    }
+                });
+            });
+        });
+    }
+
+    fn render_bulk_bar(&mut self, ui: &mut egui::Ui) {
+        let busy = self.is_busy();
+
+        ui.horizontal(|ui| {
+            ui.strong(format!("{} selected", self.selected_keys.len()));
+            ui.separator();
+
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.label("TTL");
+                let resp = ui
+                    .add(egui::TextEdit::singleline(&mut self.bulk_ttl_input).desired_width(78.0));
+                let enter_pressed =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                if ui.button("Set TTL").clicked() || enter_pressed {
+                    match self.bulk_ttl_input.trim().parse::<u32>() {
+                        Ok(ttl) => {
+                            if let Some(zone) = &mut self.zone {
+                                match zone.set_ttl_bulk(&self.selected_keys, ttl) {
+                                    Ok(_) => self.error_banner = None,
+                                    Err(err) => self.error_banner = Some(err),
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.error_banner = Some("Invalid bulk TTL.".to_owned());
+                        }
+                    }
+                }
+
+                ui.separator();
+                if ui.button("Delete Selected").clicked()
+                    && let Some(zone) = &mut self.zone
+                {
+                    zone.delete_bulk_local(&self.selected_keys);
+                }
+                if ui.button("Revert Selected").clicked()
+                    && let Some(zone) = &mut self.zone
+                {
+                    zone.revert_bulk(&self.selected_keys);
+                }
+            });
+
+            if ui.button("Clear Selection").clicked() {
+                self.selected_keys.clear();
             }
         });
     }

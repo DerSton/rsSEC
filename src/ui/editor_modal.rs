@@ -1,8 +1,11 @@
-use eframe::egui::{self, RichText};
+use std::ops::Range;
+
+use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::model::{RECORD_TYPES, RrsetData, RrsetKey, ZoneRow, ZoneState};
 use crate::rdata::{
-    default_fields_for_type, parse_record_to_fields, schema_for_type, validate_and_format,
+    FieldSpec, default_fields_for_type, parse_record_to_fields, schema_for_type,
+    validate_and_format,
 };
 use crate::ui::theme::{color_added, color_modified};
 
@@ -17,7 +20,6 @@ pub struct RecordEditorModal {
     pub custom_type: String,
     pub last_effective_type: String,
     pub ttl_input: String,
-    /// Structured field values per record row (`rows[row_idx][field_idx]`).
     pub rows: Vec<Vec<String>>,
     pub error: Option<String>,
 }
@@ -81,18 +83,19 @@ impl RecordEditorModal {
 
     pub fn sync_schema_if_type_changed(&mut self) {
         let current = self.effective_type();
-        if current != self.last_effective_type {
-            let expected_len = schema_for_type(&current).len();
-            if self.rows.is_empty()
-                || self.rows[0].len() != expected_len
-                || (self.rows.len() == 1
-                    && self.rows[0] == default_fields_for_type(&self.last_effective_type))
-            {
-                self.rows = vec![default_fields_for_type(&current)];
-            }
-            self.last_effective_type = current;
-            self.error = None;
+        if current == self.last_effective_type {
+            return;
         }
+
+        let expected_len = schema_for_type(&current).len();
+        let is_unchanged_default = self.rows.len() == 1
+            && self.rows[0] == default_fields_for_type(&self.last_effective_type);
+
+        if self.rows.is_empty() || self.rows[0].len() != expected_len || is_unchanged_default {
+            self.rows = vec![default_fields_for_type(&current)];
+        }
+        self.last_effective_type = current;
+        self.error = None;
     }
 }
 
@@ -119,22 +122,12 @@ pub fn render_editor_modal(
 
     modal.sync_schema_if_type_changed();
 
-    // Look up the authoritative deSEC cloud entry for the current (or original) key
     let target_key = modal.current_key();
     let cloud_entry = zone
         .remote
         .get(&target_key)
         .or_else(|| modal.original_key.as_ref().and_then(|k| zone.remote.get(k)));
     let cloud_ttl_str = cloud_entry.map(|c| c.ttl.to_string());
-    let active_type = modal.effective_type();
-    let cloud_rows: Vec<Vec<String>> = cloud_entry
-        .map(|c| {
-            c.records
-                .iter()
-                .map(|r| parse_record_to_fields(&active_type, r))
-                .collect()
-        })
-        .unwrap_or_default();
 
     egui::Window::new(title)
         .collapsible(false)
@@ -145,156 +138,23 @@ pub fn render_editor_modal(
         .show(ctx, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // Top row: Subname, Type (locked when editing), and TTL
-            ui.horizontal(|ui| {
-                let subname_diff = modal
-                    .original_key
-                    .as_ref()
-                    .is_some_and(|orig| orig.subname != target_key.subname);
-                ui.label(if subname_diff {
-                    RichText::new("Subname").color(color_modified(ui)).strong()
-                } else {
-                    RichText::new("Subname")
-                });
-                let mut sub_edit = egui::TextEdit::singleline(&mut modal.subname)
-                    .hint_text("@")
-                    .desired_width(240.0);
-                if subname_diff {
-                    sub_edit = sub_edit.text_color(color_modified(ui));
-                }
-                ui.add(sub_edit);
-
-                ui.add_space(8.0);
-                ui.label("Type");
-                if modal.original_key.is_some() {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(RichText::new(&active_type).monospace()),
-                    );
-                } else {
-                    let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                        "Other"
-                    } else {
-                        &modal.selected_type
-                    };
-                    egui::ComboBox::from_id_salt("editor_record_type")
-                        .selected_text(selected_display)
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for &rt in RECORD_TYPES {
-                                ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
-                            }
-                            ui.separator();
-                            ui.selectable_value(
-                                &mut modal.selected_type,
-                                CUSTOM_TYPE_SENTINEL.to_owned(),
-                                "Other",
-                            );
-                        });
-
-                    if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut modal.custom_type)
-                                .hint_text("TYPE")
-                                .desired_width(90.0),
-                        );
-                    }
-                }
-
-                ui.add_space(8.0);
-                let ttl_diff = cloud_ttl_str
-                    .as_ref()
-                    .is_some_and(|c_ttl| c_ttl != modal.ttl_input.trim());
-                ui.label(if ttl_diff {
-                    RichText::new("TTL").color(color_modified(ui)).strong()
-                } else {
-                    RichText::new("TTL")
-                });
-                let mut ttl_edit = egui::TextEdit::singleline(&mut modal.ttl_input)
-                    .hint_text(min_ttl.to_string())
-                    .desired_width(90.0);
-                if ttl_diff {
-                    ttl_edit = ttl_edit.text_color(color_modified(ui));
-                }
-                ui.add(ttl_edit);
-            });
-
+            render_header_inputs(ui, modal, &target_key, cloud_ttl_str.as_deref(), min_ttl);
             modal.sync_schema_if_type_changed();
+
             let active_type = modal.effective_type();
             let schema = schema_for_type(&active_type);
+            let cloud_rows: Vec<Vec<String>> = cloud_entry
+                .map(|c| {
+                    c.records
+                        .iter()
+                        .map(|r| parse_record_to_fields(&active_type, r))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             ui.separator();
 
-            let mut remove_idx: Option<usize> = None;
-            let can_remove = modal.rows.len() > 1;
-
-            // Render each record value as its own full-width card without unintended wrapping
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    let avail_w = ui.available_width();
-
-                    for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
-                        if row_fields.len() != schema.len() {
-                            row_fields.resize(schema.len(), String::new());
-                        }
-                        let cloud_row = cloud_rows.get(row_idx);
-
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width((avail_w - 16.0).max(200.0));
-
-                            // Split types with many fields (LOC = 10, NAPTR = 6) into 2 explicit
-                            // non-wrapping rows; all 1..=4 field types stay on a single horizontal line.
-                            let split_at = if schema.len() > 4 {
-                                schema.len() - 2
-                            } else {
-                                schema.len()
-                            };
-
-                            // First line (or sole line for 1..=4 field types)
-                            render_field_line(
-                                ui,
-                                0..split_at,
-                                row_fields,
-                                schema,
-                                cloud_entry.is_some(),
-                                cloud_row.map(Vec::as_slice),
-                                if split_at == schema.len() && can_remove {
-                                    Some(&mut remove_idx)
-                                } else {
-                                    None
-                                },
-                                row_idx,
-                            );
-
-                            // Second line only for 6+ field types (NAPTR, LOC)
-                            if split_at < schema.len() {
-                                ui.add_space(4.0);
-                                render_field_line(
-                                    ui,
-                                    split_at..schema.len(),
-                                    row_fields,
-                                    schema,
-                                    cloud_entry.is_some(),
-                                    cloud_row.map(Vec::as_slice),
-                                    if can_remove {
-                                        Some(&mut remove_idx)
-                                    } else {
-                                        None
-                                    },
-                                    row_idx,
-                                );
-                            }
-                        });
-
-                        ui.add_space(4.0);
-                    }
-                });
-
-            if let Some(idx) = remove_idx {
-                modal.rows.remove(idx);
-            }
+            render_record_cards(ui, modal, schema, cloud_entry.is_some(), &cloud_rows);
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -307,7 +167,7 @@ pub fn render_editor_modal(
                         && ui.button("Reset to Cloud").clicked()
                     {
                         modal.ttl_input = c_ttl;
-                        modal.rows = cloud_rows.clone();
+                        modal.rows = cloud_rows;
                         modal.error = None;
                     }
                 }
@@ -339,47 +199,190 @@ pub fn render_editor_modal(
     outcome
 }
 
-#[allow(clippy::too_many_arguments)]
+fn render_header_inputs(
+    ui: &mut Ui,
+    modal: &mut RecordEditorModal,
+    target_key: &RrsetKey,
+    cloud_ttl_str: Option<&str>,
+    min_ttl: u32,
+) {
+    let active_type = modal.effective_type();
+
+    ui.horizontal(|ui| {
+        let subname_changed = modal
+            .original_key
+            .as_ref()
+            .is_some_and(|orig| orig.subname != target_key.subname);
+        ui.label(styled_field_label(ui, "Subname", subname_changed));
+
+        let mut sub_edit = egui::TextEdit::singleline(&mut modal.subname)
+            .hint_text("@")
+            .desired_width(240.0);
+        if subname_changed {
+            sub_edit = sub_edit.text_color(color_modified(ui));
+        }
+        ui.add(sub_edit);
+
+        ui.add_space(8.0);
+        ui.label("Type");
+        if modal.original_key.is_some() {
+            // Existing record types are locked because RDATA schemas are incompatible across types.
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new(&active_type).monospace()),
+            );
+        } else {
+            let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                "Other"
+            } else {
+                &modal.selected_type
+            };
+            egui::ComboBox::from_id_salt("editor_record_type")
+                .selected_text(selected_display)
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for &rt in RECORD_TYPES {
+                        ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
+                    }
+                    ui.separator();
+                    ui.selectable_value(
+                        &mut modal.selected_type,
+                        CUSTOM_TYPE_SENTINEL.to_owned(),
+                        "Other",
+                    );
+                });
+
+            if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                ui.add(
+                    egui::TextEdit::singleline(&mut modal.custom_type)
+                        .hint_text("TYPE")
+                        .desired_width(90.0),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+        let ttl_changed = cloud_ttl_str.is_some_and(|c_ttl| c_ttl != modal.ttl_input.trim());
+        ui.label(styled_field_label(ui, "TTL", ttl_changed));
+
+        let mut ttl_edit = egui::TextEdit::singleline(&mut modal.ttl_input)
+            .hint_text(min_ttl.to_string())
+            .desired_width(90.0);
+        if ttl_changed {
+            ttl_edit = ttl_edit.text_color(color_modified(ui));
+        }
+        ui.add(ttl_edit);
+    });
+}
+
+fn styled_field_label(ui: &Ui, label: &str, modified: bool) -> RichText {
+    if modified {
+        RichText::new(label).color(color_modified(ui)).strong()
+    } else {
+        RichText::new(label)
+    }
+}
+
+fn render_record_cards(
+    ui: &mut Ui,
+    modal: &mut RecordEditorModal,
+    schema: &[FieldSpec],
+    has_cloud_entry: bool,
+    cloud_rows: &[Vec<String>],
+) {
+    let mut remove_idx: Option<usize> = None;
+    let can_remove = modal.rows.len() > 1;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .max_height(320.0)
+        .show(ui, |ui| {
+            let card_min_width = (ui.available_width() - 16.0).max(200.0);
+
+            for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
+                if row_fields.len() != schema.len() {
+                    row_fields.resize(schema.len(), String::new());
+                }
+                let cloud_row = cloud_rows.get(row_idx).map(Vec::as_slice);
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(card_min_width);
+
+                    // Types with 1..=4 fields fit on a single horizontal line.
+                    // Multi-part types (NAPTR = 6, LOC = 10) split cleanly across two lines.
+                    let split_at = if schema.len() > 4 {
+                        schema.len() - 2
+                    } else {
+                        schema.len()
+                    };
+                    let is_single_line = split_at == schema.len();
+
+                    if render_field_line(
+                        ui,
+                        0..split_at,
+                        row_fields,
+                        schema,
+                        has_cloud_entry,
+                        cloud_row,
+                        is_single_line && can_remove,
+                    ) {
+                        remove_idx = Some(row_idx);
+                    }
+
+                    if !is_single_line {
+                        ui.add_space(4.0);
+                        if render_field_line(
+                            ui,
+                            split_at..schema.len(),
+                            row_fields,
+                            schema,
+                            has_cloud_entry,
+                            cloud_row,
+                            can_remove,
+                        ) {
+                            remove_idx = Some(row_idx);
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+            }
+        });
+
+    if let Some(idx) = remove_idx {
+        modal.rows.remove(idx);
+    }
+}
+
+/// Renders one non-wrapping horizontal row of fields and returns `true` if `Remove` was clicked.
 fn render_field_line(
-    ui: &mut egui::Ui,
-    range: std::ops::Range<usize>,
+    ui: &mut Ui,
+    range: Range<usize>,
     row_fields: &mut [String],
-    schema: &[crate::rdata::FieldSpec],
+    schema: &[FieldSpec],
     has_cloud_entry: bool,
     cloud_row: Option<&[String]>,
-    mut remove_idx: Option<&mut Option<usize>>,
-    row_idx: usize,
-) {
+    show_remove_btn: bool,
+) -> bool {
     let last_in_line = range.end.saturating_sub(1);
-    let has_remove_btn = remove_idx.is_some();
+    let mut remove_clicked = false;
 
     ui.horizontal(|ui| {
         for field_idx in range {
             let spec = &schema[field_idx];
             let field_val = &mut row_fields[field_idx];
-            let trimmed_val = field_val.trim();
+            let diff_color =
+                field_diff_color(ui, field_val.trim(), field_idx, has_cloud_entry, cloud_row);
 
-            let diff_color = if !has_cloud_entry {
-                (!trimmed_val.is_empty()).then(|| color_added(ui))
-            } else if let Some(c_row) = cloud_row {
-                c_row
-                    .get(field_idx)
-                    .is_some_and(|c_val| c_val != trimmed_val)
-                    .then(|| color_modified(ui))
-            } else {
-                (!trimmed_val.is_empty()).then(|| color_added(ui))
-            };
-
-            let label_text = if let Some(col) = diff_color {
-                RichText::new(spec.label).color(col).strong()
-            } else {
-                RichText::new(spec.label)
+            let label_text = match diff_color {
+                Some(col) => RichText::new(spec.label).color(col).strong(),
+                None => RichText::new(spec.label),
             };
             ui.label(label_text);
 
             let is_last = field_idx == last_in_line;
             let field_width = if is_last {
-                let reserve = if has_remove_btn { 72.0 } else { 0.0 };
+                let reserve = if show_remove_btn { 72.0 } else { 0.0 };
                 (ui.available_width() - reserve).max(80.0)
             } else {
                 spec.width.min(90.0)
@@ -395,12 +398,31 @@ fn render_field_line(
             ui.add_sized([field_width, 22.0], edit);
         }
 
-        if let Some(rem) = remove_idx.as_mut()
-            && ui.button("Remove").clicked()
-        {
-            **rem = Some(row_idx);
+        if show_remove_btn && ui.button("Remove").clicked() {
+            remove_clicked = true;
         }
     });
+
+    remove_clicked
+}
+
+fn field_diff_color(
+    ui: &Ui,
+    trimmed_val: &str,
+    field_idx: usize,
+    has_cloud_entry: bool,
+    cloud_row: Option<&[String]>,
+) -> Option<Color32> {
+    if !has_cloud_entry {
+        return (!trimmed_val.is_empty()).then(|| color_added(ui));
+    }
+    if let Some(c_row) = cloud_row {
+        return c_row
+            .get(field_idx)
+            .is_some_and(|c_val| c_val != trimmed_val)
+            .then(|| color_modified(ui));
+    }
+    (!trimmed_val.is_empty()).then(|| color_added(ui))
 }
 
 fn apply_modal_to_zone(modal: &RecordEditorModal, zone: &mut ZoneState) -> Result<(), String> {
