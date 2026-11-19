@@ -25,8 +25,11 @@ pub struct RecordEditorModal {
 }
 
 impl RecordEditorModal {
-    pub fn new_empty(default_ttl: u32) -> Self {
-        let rtype = "A".to_owned();
+    pub fn new_empty(default_ttl: u32, initial_type: Option<&str>) -> Self {
+        let rtype = initial_type
+            .filter(|t| RECORD_TYPES.contains(t))
+            .unwrap_or("A")
+            .to_owned();
         Self {
             original_key: None,
             subname: String::new(),
@@ -101,7 +104,10 @@ impl RecordEditorModal {
 
 pub enum EditorOutcome {
     KeepOpen,
-    Saved,
+    Saved {
+        old_key: Option<RrsetKey>,
+        new_key: RrsetKey,
+    },
     Cancelled,
 }
 
@@ -110,6 +116,10 @@ pub fn render_editor_modal(
     modal: &mut RecordEditorModal,
     zone: &mut ZoneState,
 ) -> EditorOutcome {
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return EditorOutcome::Cancelled;
+    }
+
     let min_ttl = zone.minimum_ttl;
     let title = if modal.original_key.is_some() {
         "Edit Record"
@@ -191,7 +201,12 @@ pub fn render_editor_modal(
 
     if save_requested {
         match apply_modal_to_zone(modal, zone) {
-            Ok(()) => outcome = EditorOutcome::Saved,
+            Ok(new_key) => {
+                outcome = EditorOutcome::Saved {
+                    old_key: modal.original_key.clone(),
+                    new_key,
+                };
+            }
             Err(err) => modal.error = Some(err),
         }
     }
@@ -425,7 +440,10 @@ fn field_diff_color(
     (!trimmed_val.is_empty()).then(|| color_added(ui))
 }
 
-fn apply_modal_to_zone(modal: &RecordEditorModal, zone: &mut ZoneState) -> Result<(), String> {
+fn apply_modal_to_zone(
+    modal: &RecordEditorModal,
+    zone: &mut ZoneState,
+) -> Result<RrsetKey, String> {
     let ttl: u32 = modal
         .ttl_input
         .trim()
@@ -444,7 +462,11 @@ fn apply_modal_to_zone(modal: &RecordEditorModal, zone: &mut ZoneState) -> Resul
     let mut records = Vec::with_capacity(modal.rows.len());
     for (idx, row_fields) in modal.rows.iter().enumerate() {
         match validate_and_format(&rtype, row_fields) {
-            Ok(formatted) => records.push(formatted),
+            Ok(formatted) => {
+                if !records.contains(&formatted) {
+                    records.push(formatted);
+                }
+            }
             Err(err) => {
                 if modal.rows.len() > 1 {
                     return Err(format!("Row {}: {err}", idx + 1));
@@ -456,5 +478,6 @@ fn apply_modal_to_zone(modal: &RecordEditorModal, zone: &mut ZoneState) -> Resul
 
     let new_key = RrsetKey::new(&modal.subname, rtype);
     let data = RrsetData::new(ttl, records);
-    zone.upsert_local(modal.original_key.as_ref(), new_key, data)
+    zone.upsert_local(modal.original_key.as_ref(), new_key.clone(), data)?;
+    Ok(new_key)
 }

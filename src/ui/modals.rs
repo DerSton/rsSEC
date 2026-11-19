@@ -22,6 +22,10 @@ pub fn render_token_modal(
     busy: bool,
     error_banner: &mut Option<String>,
 ) -> TokenModalAction {
+    if connected && !busy && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return TokenModalAction::Closed;
+    }
+
     let mut action = TokenModalAction::None;
 
     egui::Window::new("API Token")
@@ -87,6 +91,10 @@ pub enum ReviewModalAction {
 }
 
 pub fn render_review_modal(ctx: &egui::Context, zone: &ZoneState, busy: bool) -> ReviewModalAction {
+    if !busy && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return ReviewModalAction::Cancel;
+    }
+
     let ops = zone.diff();
     if ops.is_empty() {
         return ReviewModalAction::Cancel;

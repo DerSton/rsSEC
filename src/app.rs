@@ -100,6 +100,17 @@ impl DesecApp {
         self.busy_label.is_some()
     }
 
+    fn has_open_modal(&self) -> bool {
+        self.show_token_modal
+            || self.editor_modal.is_some()
+            || self.show_review_modal
+            || self.pending_navigation.is_some()
+    }
+
+    fn is_background_blocked(&self) -> bool {
+        self.is_busy() || self.has_open_modal()
+    }
+
     fn domain_min_ttl(&self, name: &str) -> u32 {
         self.domains
             .iter()
@@ -223,7 +234,9 @@ impl DesecApp {
                 let current_label = self.selected_domain.as_deref().unwrap_or("None").to_owned();
                 let mut switched_to: Option<String> = None;
 
-                ui.add_enabled_ui(self.connected && !self.is_busy(), |ui| {
+                let blocked = self.is_background_blocked();
+
+                ui.add_enabled_ui(self.connected && !blocked, |ui| {
                     egui::ComboBox::from_id_salt("domain_selector")
                         .selected_text(&current_label)
                         .width(260.0)
@@ -249,7 +262,10 @@ impl DesecApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Token").clicked() {
+                    if ui
+                        .add_enabled(!blocked, egui::Button::new("Token"))
+                        .clicked()
+                    {
                         self.show_token_modal = true;
                     }
 
@@ -260,7 +276,7 @@ impl DesecApp {
                         .unwrap_or_default();
                     let dirty = !summary.is_empty();
 
-                    ui.add_enabled_ui(dirty && !self.is_busy(), |ui| {
+                    ui.add_enabled_ui(dirty && !blocked, |ui| {
                         if ui.button("Apply").clicked() {
                             self.show_review_modal = true;
                         }
@@ -384,8 +400,8 @@ impl DesecApp {
                 return;
             }
 
-            let busy = self.is_busy();
-            let actions = render_zone_table(ui, &rows, &mut self.selected_keys, busy);
+            let blocked = self.is_background_blocked();
+            let actions = render_zone_table(ui, &rows, &mut self.selected_keys, blocked);
 
             if let Some(row) = actions.edit_row {
                 self.editor_modal = Some(RecordEditorModal::from_row(&row));
@@ -409,39 +425,42 @@ impl DesecApp {
         available_types: &[String],
         default_ttl: u32,
     ) {
-        let busy = self.is_busy();
+        let blocked = self.is_background_blocked();
 
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Search")
-                    .desired_width(240.0),
-            );
+        ui.add_enabled_ui(!blocked, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("Search")
+                        .desired_width(240.0),
+                );
 
-            egui::ComboBox::from_id_salt("type_filter")
-                .selected_text(&self.type_filter)
-                .width(115.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
-                    for rtype in available_types {
-                        ui.selectable_value(&mut self.type_filter, rtype.clone(), rtype);
-                    }
-                });
+                egui::ComboBox::from_id_salt("type_filter")
+                    .selected_text(&self.type_filter)
+                    .width(115.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
+                        for rtype in available_types {
+                            ui.selectable_value(&mut self.type_filter, rtype.clone(), rtype);
+                        }
+                    });
 
-            ui.checkbox(&mut self.changes_only, "Modified only");
+                ui.checkbox(&mut self.changes_only, "Modified only");
 
-            let has_active_filter =
-                !self.search_query.is_empty() || self.type_filter != "All" || self.changes_only;
-            if has_active_filter && ui.button("Reset").clicked() {
-                self.search_query.clear();
-                self.type_filter = "All".to_owned();
-                self.changes_only = false;
-            }
+                let has_active_filter =
+                    !self.search_query.is_empty() || self.type_filter != "All" || self.changes_only;
+                if has_active_filter && ui.button("Reset").clicked() {
+                    self.search_query.clear();
+                    self.type_filter = "All".to_owned();
+                    self.changes_only = false;
+                }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(!busy, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("New Record").clicked() {
-                        self.editor_modal = Some(RecordEditorModal::new_empty(default_ttl));
+                        let initial_type =
+                            (self.type_filter != "All").then_some(self.type_filter.as_str());
+                        self.editor_modal =
+                            Some(RecordEditorModal::new_empty(default_ttl, initial_type));
                     }
                 });
             });
@@ -449,13 +468,13 @@ impl DesecApp {
     }
 
     fn render_bulk_bar(&mut self, ui: &mut egui::Ui) {
-        let busy = self.is_busy();
+        let blocked = self.is_background_blocked();
 
-        ui.horizontal(|ui| {
-            ui.strong(format!("{} selected", self.selected_keys.len()));
-            ui.separator();
+        ui.add_enabled_ui(!blocked, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(format!("{} selected", self.selected_keys.len()));
+                ui.separator();
 
-            ui.add_enabled_ui(!busy, |ui| {
                 ui.label("TTL");
                 let resp = ui
                     .add(egui::TextEdit::singleline(&mut self.bulk_ttl_input).desired_width(78.0));
@@ -489,11 +508,11 @@ impl DesecApp {
                 {
                     zone.revert_bulk(&self.selected_keys);
                 }
-            });
 
-            if ui.button("Clear Selection").clicked() {
-                self.selected_keys.clear();
-            }
+                if ui.button("Clear Selection").clicked() {
+                    self.selected_keys.clear();
+                }
+            });
         });
     }
 
@@ -530,7 +549,15 @@ impl DesecApp {
                 EditorOutcome::KeepOpen => {
                     self.editor_modal = Some(modal);
                 }
-                EditorOutcome::Saved | EditorOutcome::Cancelled => {}
+                EditorOutcome::Saved { old_key, new_key } => {
+                    if let Some(old) = old_key
+                        && old != new_key
+                        && self.selected_keys.remove(&old)
+                    {
+                        self.selected_keys.insert(new_key);
+                    }
+                }
+                EditorOutcome::Cancelled => {}
             }
         }
 
@@ -560,7 +587,7 @@ impl DesecApp {
 
         if let Some(nav) = self.pending_navigation.clone() {
             let mut confirm = false;
-            let mut cancel = false;
+            let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
             egui::Window::new("Discard Local Changes?")
                 .collapsible(false)
