@@ -454,12 +454,55 @@ impl ZoneState {
         self.local.remove(key);
     }
 
+    /// Removes multiple RRsets from `local` in bulk.
+    pub fn delete_bulk_local<'a>(&mut self, keys: impl IntoIterator<Item = &'a RrsetKey>) {
+        for key in keys {
+            self.local.remove(key);
+        }
+    }
+
+    /// Updates the TTL of multiple RRsets in `local` in bulk.
+    /// For a row currently marked as `Deleted`, restores its remote records with the new TTL.
+    pub fn set_ttl_bulk<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a RrsetKey>,
+        ttl: u32,
+    ) -> Result<usize, String> {
+        if ttl < self.minimum_ttl {
+            return Err(format!(
+                "TTL must be at least {}s (domain minimum).",
+                self.minimum_ttl
+            ));
+        }
+
+        let mut updated = 0;
+        for key in keys {
+            if let Some(loc) = self.local.get_mut(key) {
+                loc.ttl = ttl;
+                updated += 1;
+            } else if let Some(rem) = self.remote.get(key) {
+                let mut restored = rem.clone();
+                restored.ttl = ttl;
+                self.local.insert(key.clone(), restored);
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Reverts a single RRset back to its deSEC remote state.
     pub fn revert_key(&mut self, key: &RrsetKey) {
         if let Some(rem) = self.remote.get(key) {
             self.local.insert(key.clone(), rem.clone());
         } else {
             self.local.remove(key);
+        }
+    }
+
+    /// Reverts multiple RRsets back to their deSEC remote state in bulk.
+    pub fn revert_bulk<'a>(&mut self, keys: impl IntoIterator<Item = &'a RrsetKey>) {
+        for key in keys {
+            self.revert_key(key);
         }
     }
 
@@ -653,5 +696,27 @@ mod tests {
             RrsetData::new(60, vec!["192.0.2.1".to_owned()]),
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn bulk_ttl_and_bulk_delete_and_revert() {
+        let mut zone = sample_zone();
+        let keys = vec![RrsetKey::new("", "A"), RrsetKey::new("www", "AAAA")];
+
+        // Bulk update TTL to 7200
+        zone.set_ttl_bulk(&keys, 7200).unwrap();
+        assert_eq!(zone.summary().modified, 2);
+
+        // Bulk update TTL back to 3600 -> automatically Synced again
+        zone.set_ttl_bulk(&keys, 3600).unwrap();
+        assert!(!zone.is_dirty());
+
+        // Bulk delete
+        zone.delete_bulk_local(&keys);
+        assert_eq!(zone.summary().deleted, 2);
+
+        // Bulk revert
+        zone.revert_bulk(&keys);
+        assert!(!zone.is_dirty());
     }
 }

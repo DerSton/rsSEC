@@ -166,41 +166,41 @@ pub fn render_editor_modal(
                 ui.add(sub_edit);
 
                 ui.add_space(8.0);
-                let type_diff = modal
-                    .original_key
-                    .as_ref()
-                    .is_some_and(|orig| orig.rtype != target_key.rtype);
-                ui.label(if type_diff {
-                    RichText::new("Type").color(color_modified(ui)).strong()
-                } else {
-                    RichText::new("Type")
-                });
-                let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                    "Other"
-                } else {
-                    &modal.selected_type
-                };
-                egui::ComboBox::from_id_salt("editor_record_type")
-                    .selected_text(selected_display)
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        for &rt in RECORD_TYPES {
-                            ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
-                        }
-                        ui.separator();
-                        ui.selectable_value(
-                            &mut modal.selected_type,
-                            CUSTOM_TYPE_SENTINEL.to_owned(),
-                            "Other",
-                        );
-                    });
-
-                if modal.selected_type == CUSTOM_TYPE_SENTINEL {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut modal.custom_type)
-                            .hint_text("TYPE")
-                            .desired_width(90.0),
+                ui.label("Type");
+                if modal.original_key.is_some() {
+                    // Record type cannot be changed when editing an existing record
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(RichText::new(&active_type).monospace()),
                     );
+                } else {
+                    let selected_display = if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                        "Other"
+                    } else {
+                        &modal.selected_type
+                    };
+                    egui::ComboBox::from_id_salt("editor_record_type")
+                        .selected_text(selected_display)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for &rt in RECORD_TYPES {
+                                ui.selectable_value(&mut modal.selected_type, rt.to_owned(), rt);
+                            }
+                            ui.separator();
+                            ui.selectable_value(
+                                &mut modal.selected_type,
+                                CUSTOM_TYPE_SENTINEL.to_owned(),
+                                "Other",
+                            );
+                        });
+
+                    if modal.selected_type == CUSTOM_TYPE_SENTINEL {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut modal.custom_type)
+                                .hint_text("TYPE")
+                                .desired_width(90.0),
+                        );
+                    }
                 }
 
                 ui.add_space(8.0);

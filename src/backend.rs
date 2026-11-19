@@ -273,6 +273,15 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
         return "Permission denied (HTTP 403). Your token may lack permission for this domain."
             .to_owned();
     }
+    if let Some(status) = err.status()
+        && status.is_server_error()
+    {
+        let reason = status.canonical_reason().unwrap_or("Server Error");
+        return format!(
+            "deSEC server temporarily unavailable (HTTP {} {reason}). Please try again shortly.",
+            status.as_u16()
+        );
+    }
 
     if let (Some(api_err), Some(ops)) = (err.api_error(), ops)
         && let Some(items) = api_err.bulk_items()
@@ -304,13 +313,32 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
         if let Some(detail) = api_err.detail()
             && !detail.is_empty()
         {
-            return detail.to_owned();
+            return sanitize_error_text(detail);
         }
         let formatted = api_err.to_string();
         if !formatted.is_empty() {
-            return formatted;
+            return sanitize_error_text(&formatted);
         }
     }
 
-    err.to_string()
+    sanitize_error_text(&err.to_string())
+}
+
+/// Strips raw HTML error pages (e.g. from nginx/proxies) down to a single clean summary line.
+fn sanitize_error_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.contains("<html") || trimmed.contains("<HTML") || trimmed.contains("<head>") {
+        if let Some(start) = trimmed.find("<title>").or_else(|| trimmed.find("<TITLE>"))
+            && let Some(end) = trimmed[start + 7..]
+                .find("</title>")
+                .or_else(|| trimmed[start + 7..].find("</TITLE>"))
+        {
+            let title = trimmed[start + 7..start + 7 + end].trim();
+            if !title.is_empty() {
+                return format!("Server error ({title}). Please try again.");
+            }
+        }
+        return "Server returned an HTML error page. Please try again.".to_owned();
+    }
+    trimmed.to_owned()
 }

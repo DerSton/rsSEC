@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use eframe::egui::{self, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
 
@@ -10,7 +12,12 @@ pub struct TableActions {
     pub revert_key: Option<RrsetKey>,
 }
 
-pub fn render_zone_table(ui: &mut Ui, rows: &[ZoneRow], busy: bool) -> TableActions {
+pub fn render_zone_table(
+    ui: &mut Ui,
+    rows: &[ZoneRow],
+    selected_keys: &mut BTreeSet<RrsetKey>,
+    busy: bool,
+) -> TableActions {
     let mut actions = TableActions {
         edit_row: None,
         delete_key: None,
@@ -25,17 +32,40 @@ pub fn render_zone_table(ui: &mut Ui, rows: &[ZoneRow], busy: bool) -> TableActi
         })
         .collect();
 
+    let all_visible_selected =
+        !rows.is_empty() && rows.iter().all(|r| selected_keys.contains(&r.key));
+
+    // Adaptive column widths based on current window width so the table always fits cleanly
+    let total_w = ui.available_width();
+    let subname_w = (total_w * 0.16).clamp(120.0, 260.0);
+
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
+        .auto_shrink([false, false])
         .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-        .column(Column::initial(84.0).at_least(75.0)) // State
-        .column(Column::initial(180.0).at_least(100.0)) // Subname
-        .column(Column::initial(100.0).at_least(75.0)) // Type
-        .column(Column::initial(110.0).at_least(70.0)) // TTL
-        .column(Column::remainder().at_least(280.0)) // Records
-        .column(Column::initial(180.0).at_least(170.0)) // Actions
-        .header(22.0, |mut header| {
+        .column(Column::exact(32.0)) // Bulk select checkbox
+        .column(Column::initial(80.0).at_least(72.0)) // State
+        .column(Column::initial(subname_w).at_least(100.0)) // Subname
+        .column(Column::initial(92.0).at_least(70.0)) // Type
+        .column(Column::initial(110.0).at_least(75.0)) // TTL
+        .column(Column::remainder().at_least(220.0)) // Records (fills remaining space)
+        .column(Column::exact(184.0)) // Actions (fixed right column so buttons never clip)
+        .header(24.0, |mut header| {
+            header.col(|ui| {
+                let mut toggle_all = all_visible_selected;
+                if ui.checkbox(&mut toggle_all, "").changed() {
+                    if toggle_all {
+                        for r in rows {
+                            selected_keys.insert(r.key.clone());
+                        }
+                    } else {
+                        for r in rows {
+                            selected_keys.remove(&r.key);
+                        }
+                    }
+                }
+            });
             header.col(|ui| {
                 ui.strong("State");
             });
@@ -58,6 +88,18 @@ pub fn render_zone_table(ui: &mut Ui, rows: &[ZoneRow], busy: bool) -> TableActi
         .body(|body| {
             body.heterogeneous_rows(row_heights.into_iter(), |mut table_row| {
                 let row = &rows[table_row.index()];
+
+                // 0. Select checkbox
+                table_row.col(|ui| {
+                    let mut is_selected = selected_keys.contains(&row.key);
+                    if ui.checkbox(&mut is_selected, "").changed() {
+                        if is_selected {
+                            selected_keys.insert(row.key.clone());
+                        } else {
+                            selected_keys.remove(&row.key);
+                        }
+                    }
+                });
 
                 // 1. State
                 table_row.col(|ui| {
@@ -125,7 +167,7 @@ pub fn render_zone_table(ui: &mut Ui, rows: &[ZoneRow], busy: bool) -> TableActi
                     }
                 });
 
-                // 5. Records (only changed values are colored; unchanged values in a modified RRset stay normal!)
+                // 5. Records (only changed values are colored; unchanged values in a modified RRset stay normal)
                 table_row.col(|ui| {
                     let diffs = row.record_diffs();
                     ui.vertical(|ui| {

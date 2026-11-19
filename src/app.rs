@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
+
 use eframe::egui::{self, RichText};
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
-use crate::model::{DomainSummary, ZoneRow, ZoneState};
+use crate::model::{DomainSummary, RrsetKey, ZoneRow, ZoneState};
 use crate::token::{self, TokenSource};
 use crate::ui::editor_modal::{EditorOutcome, RecordEditorModal, render_editor_modal};
 use crate::ui::modals::{
@@ -34,10 +36,12 @@ pub struct DesecApp {
     selected_domain: Option<String>,
     zone: Option<ZoneState>,
 
-    // Filters
+    // Filters & bulk selection
     search_query: String,
     type_filter: String,
     changes_only: bool,
+    selected_keys: BTreeSet<RrsetKey>,
+    bulk_ttl_input: String,
 
     // Modals
     editor_modal: Option<RecordEditorModal>,
@@ -47,6 +51,12 @@ pub struct DesecApp {
 
 impl DesecApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Work around an integer underflow bug in egui/epaint 0.37.0's new IME preedit
+        // underline renderer on Wayland (`preedit_range.end.index - preedit_range.start.index`).
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.visuals.ime_composition.legacy_visuals = true;
+        });
+
         let backend = BackendHandle::spawn(cc.egui_ctx.clone());
 
         let loaded = token::load_token();
@@ -83,6 +93,8 @@ impl DesecApp {
             search_query: String::new(),
             type_filter: "All".to_owned(),
             changes_only: false,
+            selected_keys: BTreeSet::new(),
+            bulk_ttl_input: "3600".to_owned(),
             editor_modal: None,
             show_review_modal: false,
             pending_navigation: None,
@@ -104,6 +116,7 @@ impl DesecApp {
     fn request_fetch_zone(&mut self, domain: String) {
         let minimum_ttl = self.domain_min_ttl(&domain);
         self.selected_domain = Some(domain.clone());
+        self.selected_keys.clear();
         self.busy_label = Some(format!("Loading {domain}..."));
         self.status_message = format!("Fetching {domain}...");
         self.error_banner = None;
@@ -147,6 +160,8 @@ impl DesecApp {
                     let count = rrsets.len();
                     self.zone = Some(ZoneState::from_remote(domain.clone(), minimum_ttl, rrsets));
                     self.selected_domain = Some(domain.clone());
+                    self.selected_keys.clear();
+                    self.bulk_ttl_input = minimum_ttl.max(3600).to_string();
                     self.busy_label = None;
                     self.show_review_modal = false;
                     self.editor_modal = None;
@@ -161,6 +176,7 @@ impl DesecApp {
                 } => {
                     let count = rrsets.len();
                     self.zone = Some(ZoneState::from_remote(domain.clone(), minimum_ttl, rrsets));
+                    self.selected_keys.clear();
                     self.busy_label = None;
                     self.show_review_modal = false;
                     self.error_banner = None;
@@ -345,6 +361,10 @@ impl DesecApp {
                 return;
             };
 
+            // Prune any selected keys that no longer exist in the current zone
+            let valid_keys: BTreeSet<RrsetKey> = all_rows.iter().map(|r| r.key.clone()).collect();
+            self.selected_keys.retain(|k| valid_keys.contains(k));
+
             let busy = self.is_busy();
 
             // Compact filter & action bar
@@ -352,12 +372,12 @@ impl DesecApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .hint_text("Search")
-                        .desired_width(260.0),
+                        .desired_width(240.0),
                 );
 
                 egui::ComboBox::from_id_salt("type_filter")
                     .selected_text(&self.type_filter)
-                    .width(120.0)
+                    .width(115.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.type_filter, "All".to_owned(), "All");
                         for rtype in &available_types {
@@ -383,6 +403,74 @@ impl DesecApp {
                     });
                 });
             });
+
+            // Bulk action bar (shown whenever at least one record is selected)
+            if !self.selected_keys.is_empty() {
+                ui.separator();
+                let mut trigger_bulk_ttl = false;
+                let mut trigger_bulk_delete = false;
+                let mut trigger_bulk_revert = false;
+                let mut trigger_clear_selection = false;
+
+                ui.horizontal(|ui| {
+                    ui.strong(format!("{} selected", self.selected_keys.len()));
+                    ui.separator();
+
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.label("TTL");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.bulk_ttl_input)
+                                .desired_width(78.0),
+                        );
+                        let enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Set TTL").clicked() || enter {
+                            trigger_bulk_ttl = true;
+                        }
+
+                        ui.separator();
+                        if ui.button("Delete Selected").clicked() {
+                            trigger_bulk_delete = true;
+                        }
+                        if ui.button("Revert Selected").clicked() {
+                            trigger_bulk_revert = true;
+                        }
+                    });
+
+                    if ui.button("Clear Selection").clicked() {
+                        trigger_clear_selection = true;
+                    }
+                });
+
+                if trigger_bulk_ttl {
+                    match self.bulk_ttl_input.trim().parse::<u32>() {
+                        Ok(ttl) => {
+                            if let Some(zone) = &mut self.zone {
+                                match zone.set_ttl_bulk(&self.selected_keys, ttl) {
+                                    Ok(_) => {
+                                        self.error_banner = None;
+                                    }
+                                    Err(err) => {
+                                        self.error_banner = Some(err);
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.error_banner = Some("Invalid bulk TTL.".to_owned());
+                        }
+                    }
+                }
+                if trigger_bulk_delete && let Some(zone) = &mut self.zone {
+                    zone.delete_bulk_local(&self.selected_keys);
+                }
+                if trigger_bulk_revert && let Some(zone) = &mut self.zone {
+                    zone.revert_bulk(&self.selected_keys);
+                }
+                if trigger_clear_selection {
+                    self.selected_keys.clear();
+                }
+            }
 
             ui.separator();
 
@@ -422,7 +510,7 @@ impl DesecApp {
                 return;
             }
 
-            let actions = render_zone_table(ui, &rows, busy);
+            let actions = render_zone_table(ui, &rows, &mut self.selected_keys, busy);
 
             if let Some(row) = actions.edit_row {
                 self.editor_modal = Some(RecordEditorModal::from_row(&row));
