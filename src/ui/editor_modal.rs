@@ -1,5 +1,4 @@
 use eframe::egui::{self, RichText};
-use egui_extras::{Column, TableBuilder};
 
 use crate::model::{RECORD_TYPES, RrsetData, RrsetKey, ZoneRow, ZoneState};
 use crate::rdata::{
@@ -20,8 +19,6 @@ pub struct RecordEditorModal {
     pub ttl_input: String,
     /// Structured field values per record row (`rows[row_idx][field_idx]`).
     pub rows: Vec<Vec<String>>,
-    /// Snapshot of remote cloud fields (if an RRset for the target key exists in deSEC cloud)
-    /// used to live-highlight exact changed fields inside the editor.
     pub error: Option<String>,
 }
 
@@ -143,10 +140,12 @@ pub fn render_editor_modal(
         .collapsible(false)
         .resizable(true)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(760.0)
-        .min_width(640.0)
+        .default_width(720.0)
+        .min_width(580.0)
         .show(ctx, |ui| {
-            // Top row: Subname, Type, and TTL (highlighted if different from cloud)
+            ui.set_min_width(ui.available_width());
+
+            // Top row: Subname, Type (locked when editing), and TTL
             ui.horizontal(|ui| {
                 let subname_diff = modal
                     .original_key
@@ -168,7 +167,6 @@ pub fn render_editor_modal(
                 ui.add_space(8.0);
                 ui.label("Type");
                 if modal.original_key.is_some() {
-                    // Record type cannot be changed when editing an existing record
                     ui.add_enabled(
                         false,
                         egui::Button::new(RichText::new(&active_type).monospace()),
@@ -214,7 +212,7 @@ pub fn render_editor_modal(
                 });
                 let mut ttl_edit = egui::TextEdit::singleline(&mut modal.ttl_input)
                     .hint_text(min_ttl.to_string())
-                    .desired_width(85.0);
+                    .desired_width(90.0);
                 if ttl_diff {
                     ttl_edit = ttl_edit.text_color(color_modified(ui));
                 }
@@ -229,86 +227,70 @@ pub fn render_editor_modal(
 
             let mut remove_idx: Option<usize> = None;
             let can_remove = modal.rows.len() > 1;
-            let last_field_idx = schema.len().saturating_sub(1);
 
-            ui.push_id(&active_type, |ui| {
-                let mut table = TableBuilder::new(ui)
-                    .striped(true)
-                    .vscroll(true)
-                    .max_scroll_height(280.0)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            // Render each record value as its own full-width card without unintended wrapping
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    let avail_w = ui.available_width();
 
-                for (idx, spec) in schema.iter().enumerate() {
-                    if idx == last_field_idx {
-                        table = table.column(Column::remainder().at_least(spec.width));
-                    } else {
-                        table = table
-                            .column(Column::initial(spec.width).at_least(44.0).resizable(true));
-                    }
-                }
-                if can_remove {
-                    table = table.column(Column::exact(68.0));
-                }
-
-                table
-                    .header(22.0, |mut header| {
-                        for spec in schema {
-                            header.col(|ui| {
-                                ui.strong(spec.label);
-                            });
+                    for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
+                        if row_fields.len() != schema.len() {
+                            row_fields.resize(schema.len(), String::new());
                         }
-                        if can_remove {
-                            header.col(|_ui| {});
-                        }
-                    })
-                    .body(|mut body| {
-                        for (row_idx, row_fields) in modal.rows.iter_mut().enumerate() {
-                            if row_fields.len() != schema.len() {
-                                row_fields.resize(schema.len(), String::new());
+                        let cloud_row = cloud_rows.get(row_idx);
+
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width((avail_w - 16.0).max(200.0));
+
+                            // Split types with many fields (LOC = 10, NAPTR = 6) into 2 explicit
+                            // non-wrapping rows; all 1..=4 field types stay on a single horizontal line.
+                            let split_at = if schema.len() > 4 {
+                                schema.len() - 2
+                            } else {
+                                schema.len()
+                            };
+
+                            // First line (or sole line for 1..=4 field types)
+                            render_field_line(
+                                ui,
+                                0..split_at,
+                                row_fields,
+                                schema,
+                                cloud_entry.is_some(),
+                                cloud_row.map(Vec::as_slice),
+                                if split_at == schema.len() && can_remove {
+                                    Some(&mut remove_idx)
+                                } else {
+                                    None
+                                },
+                                row_idx,
+                            );
+
+                            // Second line only for 6+ field types (NAPTR, LOC)
+                            if split_at < schema.len() {
+                                ui.add_space(4.0);
+                                render_field_line(
+                                    ui,
+                                    split_at..schema.len(),
+                                    row_fields,
+                                    schema,
+                                    cloud_entry.is_some(),
+                                    cloud_row.map(Vec::as_slice),
+                                    if can_remove {
+                                        Some(&mut remove_idx)
+                                    } else {
+                                        None
+                                    },
+                                    row_idx,
+                                );
                             }
-                            let cloud_row = cloud_rows.get(row_idx);
+                        });
 
-                            body.row(28.0, |mut row| {
-                                for (field_idx, (field_val, spec)) in
-                                    row_fields.iter_mut().zip(schema.iter()).enumerate()
-                                {
-                                    row.col(|ui| {
-                                        let w = ui.available_width().max(24.0);
-                                        let trimmed_val = field_val.trim();
-
-                                        // Compute live diff highlight color before mutably borrowing `field_val`
-                                        let diff_color = if cloud_entry.is_none() {
-                                            (!trimmed_val.is_empty()).then(|| color_added(ui))
-                                        } else if let Some(c_row) = cloud_row {
-                                            c_row
-                                                .get(field_idx)
-                                                .is_some_and(|c_val| c_val != trimmed_val)
-                                                .then(|| color_modified(ui))
-                                        } else {
-                                            (!trimmed_val.is_empty()).then(|| color_added(ui))
-                                        };
-
-                                        let mut edit = egui::TextEdit::singleline(field_val)
-                                            .hint_text(spec.hint)
-                                            .code_editor();
-                                        if let Some(col) = diff_color {
-                                            edit = edit.text_color(col);
-                                        }
-
-                                        ui.add_sized([w, 22.0], edit);
-                                    });
-                                }
-                                if can_remove {
-                                    row.col(|ui| {
-                                        if ui.button("Remove").clicked() {
-                                            remove_idx = Some(row_idx);
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    });
-            });
+                        ui.add_space(4.0);
+                    }
+                });
 
             if let Some(idx) = remove_idx {
                 modal.rows.remove(idx);
@@ -355,6 +337,70 @@ pub fn render_editor_modal(
     }
 
     outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_field_line(
+    ui: &mut egui::Ui,
+    range: std::ops::Range<usize>,
+    row_fields: &mut [String],
+    schema: &[crate::rdata::FieldSpec],
+    has_cloud_entry: bool,
+    cloud_row: Option<&[String]>,
+    mut remove_idx: Option<&mut Option<usize>>,
+    row_idx: usize,
+) {
+    let last_in_line = range.end.saturating_sub(1);
+    let has_remove_btn = remove_idx.is_some();
+
+    ui.horizontal(|ui| {
+        for field_idx in range {
+            let spec = &schema[field_idx];
+            let field_val = &mut row_fields[field_idx];
+            let trimmed_val = field_val.trim();
+
+            let diff_color = if !has_cloud_entry {
+                (!trimmed_val.is_empty()).then(|| color_added(ui))
+            } else if let Some(c_row) = cloud_row {
+                c_row
+                    .get(field_idx)
+                    .is_some_and(|c_val| c_val != trimmed_val)
+                    .then(|| color_modified(ui))
+            } else {
+                (!trimmed_val.is_empty()).then(|| color_added(ui))
+            };
+
+            let label_text = if let Some(col) = diff_color {
+                RichText::new(spec.label).color(col).strong()
+            } else {
+                RichText::new(spec.label)
+            };
+            ui.label(label_text);
+
+            let is_last = field_idx == last_in_line;
+            let field_width = if is_last {
+                let reserve = if has_remove_btn { 72.0 } else { 0.0 };
+                (ui.available_width() - reserve).max(80.0)
+            } else {
+                spec.width.min(90.0)
+            };
+
+            let mut edit = egui::TextEdit::singleline(field_val)
+                .hint_text(spec.hint)
+                .code_editor()
+                .desired_width(field_width);
+            if let Some(col) = diff_color {
+                edit = edit.text_color(col);
+            }
+            ui.add_sized([field_width, 22.0], edit);
+        }
+
+        if let Some(rem) = remove_idx.as_mut()
+            && ui.button("Remove").clicked()
+        {
+            **rem = Some(row_idx);
+        }
+    });
 }
 
 fn apply_modal_to_zone(modal: &RecordEditorModal, zone: &mut ZoneState) -> Result<(), String> {

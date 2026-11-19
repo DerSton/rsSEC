@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
-use eframe::egui::{self, RichText, Ui};
-use egui_extras::{Column, TableBuilder};
+use eframe::egui::{self, RichText, Stroke, Ui};
 
 use crate::model::{RowStatus, RrsetKey, ValueDiffKind, ZoneRow};
 use crate::ui::theme::{color_added, color_deleted, color_modified, status_color};
@@ -24,154 +23,145 @@ pub fn render_zone_table(
         revert_key: None,
     };
 
-    let row_heights: Vec<f32> = rows
-        .iter()
-        .map(|r| {
-            let lines = r.record_diffs().len().max(1) as f32;
-            (lines * 18.0 + 10.0).max(28.0)
-        })
-        .collect();
-
     let all_visible_selected =
         !rows.is_empty() && rows.iter().all(|r| selected_keys.contains(&r.key));
 
-    // Adaptive column widths based on current window width so the table always fits cleanly
-    let total_w = ui.available_width();
-    let subname_w = (total_w * 0.16).clamp(120.0, 260.0);
-
-    TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        .auto_shrink([false, false])
-        .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-        .column(Column::exact(32.0)) // Bulk select checkbox
-        .column(Column::initial(80.0).at_least(72.0)) // State
-        .column(Column::initial(subname_w).at_least(100.0)) // Subname
-        .column(Column::initial(92.0).at_least(70.0)) // Type
-        .column(Column::initial(110.0).at_least(75.0)) // TTL
-        .column(Column::remainder().at_least(220.0)) // Records (fills remaining space)
-        .column(Column::exact(184.0)) // Actions (fixed right column so buttons never clip)
-        .header(24.0, |mut header| {
-            header.col(|ui| {
-                let mut toggle_all = all_visible_selected;
-                if ui.checkbox(&mut toggle_all, "").changed() {
-                    if toggle_all {
-                        for r in rows {
-                            selected_keys.insert(r.key.clone());
-                        }
-                    } else {
-                        for r in rows {
-                            selected_keys.remove(&r.key);
-                        }
-                    }
+    // Compact select-all bar above the cards
+    ui.horizontal(|ui| {
+        let mut toggle_all = all_visible_selected;
+        if ui
+            .checkbox(&mut toggle_all, format!("Select all ({})", rows.len()))
+            .changed()
+        {
+            if toggle_all {
+                for r in rows {
+                    selected_keys.insert(r.key.clone());
                 }
-            });
-            header.col(|ui| {
-                ui.strong("State");
-            });
-            header.col(|ui| {
-                ui.strong("Subname");
-            });
-            header.col(|ui| {
-                ui.strong("Type");
-            });
-            header.col(|ui| {
-                ui.strong("TTL");
-            });
-            header.col(|ui| {
-                ui.strong("Records");
-            });
-            header.col(|ui| {
-                ui.strong("Actions");
-            });
-        })
-        .body(|body| {
-            body.heterogeneous_rows(row_heights.into_iter(), |mut table_row| {
-                let row = &rows[table_row.index()];
+            } else {
+                for r in rows {
+                    selected_keys.remove(&r.key);
+                }
+            }
+        }
+    });
+    ui.add_space(4.0);
 
-                // 0. Select checkbox
-                table_row.col(|ui| {
-                    let mut is_selected = selected_keys.contains(&row.key);
-                    if ui.checkbox(&mut is_selected, "").changed() {
-                        if is_selected {
-                            selected_keys.insert(row.key.clone());
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let full_width = ui.available_width();
+
+            for row in rows {
+                let state_col = status_color(ui, row.status);
+                let mut frame = egui::Frame::group(ui.style());
+                if row.status.is_changed() {
+                    frame = frame.stroke(Stroke::new(1.0, state_col));
+                }
+
+                frame.show(ui, |ui| {
+                    ui.set_min_width((full_width - 16.0).max(200.0));
+
+                    // Card Header: Left = Checkbox, Subname, Type, TTL, State | Right = Edit, Delete, Revert
+                    ui.horizontal(|ui| {
+                        let mut is_selected = selected_keys.contains(&row.key);
+                        if ui.checkbox(&mut is_selected, "").changed() {
+                            if is_selected {
+                                selected_keys.insert(row.key.clone());
+                            } else {
+                                selected_keys.remove(&row.key);
+                            }
+                        }
+
+                        // Subname
+                        let mut sub_text = RichText::new(row.key.display_subname())
+                            .monospace()
+                            .strong();
+                        match row.status {
+                            RowStatus::Added => sub_text = sub_text.color(color_added(ui)),
+                            RowStatus::Deleted => {
+                                sub_text = sub_text.color(color_deleted(ui)).strikethrough();
+                            }
+                            RowStatus::Synced | RowStatus::Modified => {}
+                        }
+                        ui.label(sub_text);
+
+                        ui.separator();
+
+                        // Record Type
+                        let mut type_text = RichText::new(&row.key.rtype).monospace().strong();
+                        match row.status {
+                            RowStatus::Added => type_text = type_text.color(color_added(ui)),
+                            RowStatus::Deleted => {
+                                type_text = type_text.color(color_deleted(ui)).strikethrough();
+                            }
+                            RowStatus::Synced | RowStatus::Modified => {}
+                        }
+                        ui.label(type_text);
+
+                        ui.separator();
+
+                        // TTL (with live cloud vs local diff)
+                        if row.ttl_changed()
+                            && let (Some(rem), Some(loc)) = (&row.remote, &row.local)
+                        {
+                            ui.label(
+                                RichText::new(format!("TTL {} -> {}", rem.ttl, loc.ttl))
+                                    .monospace()
+                                    .color(color_modified(ui))
+                                    .strong(),
+                            );
+                        } else if let (None, Some(loc)) = (&row.remote, &row.local) {
+                            ui.label(
+                                RichText::new(format!("TTL {}", loc.ttl))
+                                    .monospace()
+                                    .color(color_added(ui)),
+                            );
+                        } else if let (Some(rem), None) = (&row.remote, &row.local) {
+                            ui.label(
+                                RichText::new(format!("TTL {}", rem.ttl))
+                                    .monospace()
+                                    .color(color_deleted(ui))
+                                    .strikethrough(),
+                            );
+                        } else if let Some(loc) = &row.local {
+                            ui.monospace(format!("TTL {}", loc.ttl));
+                        }
+
+                        ui.separator();
+
+                        // Sync Status badge
+                        let status_text = RichText::new(row.status.label()).color(state_col);
+                        if row.status.is_changed() {
+                            ui.label(status_text.strong());
                         } else {
-                            selected_keys.remove(&row.key);
+                            ui.label(status_text);
                         }
-                    }
-                });
 
-                // 1. State
-                table_row.col(|ui| {
-                    let state_col = status_color(ui, row.status);
-                    let text = RichText::new(row.status.label()).color(state_col);
-                    if row.status.is_changed() {
-                        ui.label(text.strong());
-                    } else {
-                        ui.label(text);
-                    }
-                });
+                        // Right-aligned actions (`Edit` and `Delete` are always visible)
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                let can_delete = row.status != RowStatus::Deleted;
+                                if ui
+                                    .add_enabled(can_delete, egui::Button::new("Delete"))
+                                    .clicked()
+                                {
+                                    actions.delete_key = Some(row.key.clone());
+                                }
+                                if ui.button("Edit").clicked() {
+                                    actions.edit_row = Some(row.clone());
+                                }
+                                if row.status.is_changed() && ui.button("Revert").clicked() {
+                                    actions.revert_key = Some(row.key.clone());
+                                }
+                            });
+                        });
+                    });
 
-                // 2. Subname (colored if whole RRset is newly added or deleted)
-                table_row.col(|ui| {
-                    let mut text = RichText::new(row.key.display_subname()).monospace();
-                    match row.status {
-                        RowStatus::Added => text = text.color(color_added(ui)),
-                        RowStatus::Deleted => {
-                            text = text.color(color_deleted(ui)).strikethrough();
-                        }
-                        RowStatus::Synced | RowStatus::Modified => {}
-                    }
-                    ui.label(text);
-                });
+                    ui.separator();
 
-                // 3. Type
-                table_row.col(|ui| {
-                    let mut text = RichText::new(&row.key.rtype).monospace();
-                    match row.status {
-                        RowStatus::Added => text = text.color(color_added(ui)),
-                        RowStatus::Deleted => {
-                            text = text.color(color_deleted(ui)).strikethrough();
-                        }
-                        RowStatus::Synced | RowStatus::Modified => {}
-                    }
-                    ui.label(text);
-                });
-
-                // 4. TTL (shows `old -> new` in diff color only when TTL actually changed)
-                table_row.col(|ui| {
-                    if row.ttl_changed()
-                        && let (Some(rem), Some(loc)) = (&row.remote, &row.local)
-                    {
-                        ui.label(
-                            RichText::new(format!("{} -> {}", rem.ttl, loc.ttl))
-                                .monospace()
-                                .color(color_modified(ui))
-                                .strong(),
-                        );
-                    } else if let (None, Some(loc)) = (&row.remote, &row.local) {
-                        ui.label(
-                            RichText::new(loc.ttl.to_string())
-                                .monospace()
-                                .color(color_added(ui)),
-                        );
-                    } else if let (Some(rem), None) = (&row.remote, &row.local) {
-                        ui.label(
-                            RichText::new(rem.ttl.to_string())
-                                .monospace()
-                                .color(color_deleted(ui))
-                                .strikethrough(),
-                        );
-                    } else if let Some(loc) = &row.local {
-                        ui.monospace(loc.ttl.to_string());
-                    }
-                });
-
-                // 5. Records (only changed values are colored; unchanged values in a modified RRset stay normal)
-                table_row.col(|ui| {
-                    let diffs = row.record_diffs();
+                    // Card Body: Full-width record values with live cloud vs local diff coloring
                     ui.vertical(|ui| {
-                        for item in diffs {
+                        for item in row.record_diffs() {
                             match item.kind {
                                 ValueDiffKind::Unchanged => {
                                     ui.monospace(&item.value);
@@ -196,27 +186,8 @@ pub fn render_zone_table(
                     });
                 });
 
-                // 6. Actions (`Edit` and `Delete` NEVER disappear)
-                table_row.col(|ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Edit").clicked() {
-                                actions.edit_row = Some(row.clone());
-                            }
-                            let can_delete = row.status != RowStatus::Deleted;
-                            if ui
-                                .add_enabled(can_delete, egui::Button::new("Delete"))
-                                .clicked()
-                            {
-                                actions.delete_key = Some(row.key.clone());
-                            }
-                            if row.status.is_changed() && ui.button("Revert").clicked() {
-                                actions.revert_key = Some(row.key.clone());
-                            }
-                        });
-                    });
-                });
-            });
+                ui.add_space(6.0);
+            }
         });
 
     actions
