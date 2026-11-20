@@ -4,6 +4,7 @@ mod model;
 mod rdata;
 mod token;
 mod ui;
+mod zonefile;
 
 use eframe::egui;
 

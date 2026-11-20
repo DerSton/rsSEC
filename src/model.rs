@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::zonefile::{ImportMode, is_desec_managed_key, is_singleton_rtype};
+
 pub const RECORD_TYPES: &[&str] = &[
     "A",
     "AAAA",
@@ -507,11 +509,240 @@ impl ZoneState {
         self.local = self.remote.clone();
     }
 
+    /// Computes what `self.local` would look like after applying `imported` under `mode`.
+    pub fn compute_imported_local(
+        &self,
+        imported: &BTreeMap<RrsetKey, RrsetData>,
+        mode: ImportMode,
+    ) -> BTreeMap<RrsetKey, RrsetData> {
+        match mode {
+            ImportMode::MergeUpdate => {
+                let mut next = self.local.clone();
+                for (key, data) in imported {
+                    next.insert(key.clone(), data.clone());
+                }
+                next
+            }
+            ImportMode::MergeAppend => {
+                let mut next = self.local.clone();
+                for (key, data) in imported {
+                    if is_singleton_rtype(&key.rtype) || !next.contains_key(key) {
+                        next.insert(key.clone(), data.clone());
+                    } else if let Some(existing) = next.get_mut(key) {
+                        for record in &data.records {
+                            if !existing.records.contains(record) {
+                                existing.records.push(record.clone());
+                            }
+                        }
+                    }
+                }
+                next
+            }
+            ImportMode::Replace => {
+                let mut next = BTreeMap::new();
+                // Preserve deSEC-managed keys (such as apex NS) so Apply never fails with HTTP 400.
+                for (key, data) in &self.remote {
+                    if is_desec_managed_key(key) {
+                        next.insert(key.clone(), data.clone());
+                    }
+                }
+                for (key, data) in &self.local {
+                    if is_desec_managed_key(key) {
+                        next.insert(key.clone(), data.clone());
+                    }
+                }
+                for (key, data) in imported {
+                    if !is_desec_managed_key(key) {
+                        next.insert(key.clone(), data.clone());
+                    }
+                }
+                next
+            }
+        }
+    }
+
+    /// Previews how many RRsets will be added, modified, or deleted relative to current `self.local`.
+    pub fn preview_import(
+        &self,
+        imported: &BTreeMap<RrsetKey, RrsetData>,
+        mode: ImportMode,
+    ) -> DiffSummary {
+        let next = self.compute_imported_local(imported, mode);
+        diff_summary_between(&self.local, &next)
+    }
+
+    /// Applies parsed zonefile RRsets into `self.local` (staged locally until Apply).
+    pub fn apply_import_local(
+        &mut self,
+        imported: &BTreeMap<RrsetKey, RrsetData>,
+        mode: ImportMode,
+    ) -> Result<DiffSummary, String> {
+        for (key, data) in imported {
+            if key.rtype.is_empty() {
+                return Err("Imported record type cannot be empty.".to_owned());
+            }
+            if data.records.is_empty() {
+                return Err(format!(
+                    "{} {}: imported RRset has no record values.",
+                    key.display_subname(),
+                    key.rtype
+                ));
+            }
+            if data.ttl < self.minimum_ttl {
+                return Err(format!(
+                    "{} {}: TTL {}s is below domain minimum ({}s).",
+                    key.display_subname(),
+                    key.rtype,
+                    data.ttl,
+                    self.minimum_ttl
+                ));
+            }
+        }
+
+        let next = self.compute_imported_local(imported, mode);
+        let summary = diff_summary_between(&self.local, &next);
+        self.local = next;
+        Ok(summary)
+    }
+
     pub fn available_record_types(&self) -> Vec<String> {
         let mut types: BTreeSet<String> = RECORD_TYPES.iter().map(|s| (*s).to_owned()).collect();
         for key in self.remote.keys().chain(self.local.keys()) {
             types.insert(key.rtype.clone());
         }
         types.into_iter().collect()
+    }
+}
+
+pub fn diff_summary_between(
+    base: &BTreeMap<RrsetKey, RrsetData>,
+    target: &BTreeMap<RrsetKey, RrsetData>,
+) -> DiffSummary {
+    let mut keys = BTreeSet::new();
+    keys.extend(base.keys());
+    keys.extend(target.keys());
+
+    let mut summary = DiffSummary::default();
+    for key in keys {
+        match (base.get(key), target.get(key)) {
+            (None, Some(_)) => summary.added += 1,
+            (Some(old), Some(new)) if old != new => summary.modified += 1,
+            (Some(_), None) => summary.deleted += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_zone() -> ZoneState {
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            RrsetKey::new("", "NS"),
+            RrsetData::new(3600, vec!["ns1.desec.io.".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("", "A"),
+            RrsetData::new(3600, vec!["192.0.2.1".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("www", "CNAME"),
+            RrsetData::new(3600, vec!["example.com.".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("old", "A"),
+            RrsetData::new(3600, vec!["192.0.2.99".to_owned()]),
+        );
+        ZoneState::from_remote("example.com".to_owned(), 3600, remote)
+    }
+
+    fn sample_import() -> BTreeMap<RrsetKey, RrsetData> {
+        let mut imp = BTreeMap::new();
+        imp.insert(
+            RrsetKey::new("", "A"),
+            RrsetData::new(7200, vec!["192.0.2.2".to_owned()]),
+        );
+        imp.insert(
+            RrsetKey::new("www", "CNAME"),
+            RrsetData::new(3600, vec!["cdn.example.com.".to_owned()]),
+        );
+        imp.insert(
+            RrsetKey::new("new", "AAAA"),
+            RrsetData::new(3600, vec!["2001:db8::1".to_owned()]),
+        );
+        imp
+    }
+
+    #[test]
+    fn merge_update_overwrites_matching_and_keeps_untouched() {
+        let mut zone = sample_zone();
+        let summary = zone
+            .apply_import_local(&sample_import(), ImportMode::MergeUpdate)
+            .unwrap();
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 1,
+                modified: 2,
+                deleted: 0
+            }
+        );
+        assert_eq!(
+            zone.local.get(&RrsetKey::new("", "A")).unwrap().records,
+            vec!["192.0.2.2"]
+        );
+        assert_eq!(zone.local.get(&RrsetKey::new("", "A")).unwrap().ttl, 7200);
+        assert!(zone.local.contains_key(&RrsetKey::new("old", "A")));
+    }
+
+    #[test]
+    fn merge_append_unions_values_and_overwrites_cname() {
+        let mut zone = sample_zone();
+        let summary = zone
+            .apply_import_local(&sample_import(), ImportMode::MergeAppend)
+            .unwrap();
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 1,
+                modified: 2,
+                deleted: 0
+            }
+        );
+        assert_eq!(
+            zone.local.get(&RrsetKey::new("", "A")).unwrap().records,
+            vec!["192.0.2.1", "192.0.2.2"]
+        );
+        assert_eq!(zone.local.get(&RrsetKey::new("", "A")).unwrap().ttl, 3600);
+        assert_eq!(
+            zone.local
+                .get(&RrsetKey::new("www", "CNAME"))
+                .unwrap()
+                .records,
+            vec!["cdn.example.com."]
+        );
+        assert!(zone.local.contains_key(&RrsetKey::new("old", "A")));
+    }
+
+    #[test]
+    fn replace_deletes_unmentioned_but_preserves_apex_ns() {
+        let mut zone = sample_zone();
+        let summary = zone
+            .apply_import_local(&sample_import(), ImportMode::Replace)
+            .unwrap();
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 1,
+                modified: 2,
+                deleted: 1
+            }
+        );
+        assert!(!zone.local.contains_key(&RrsetKey::new("old", "A")));
+        assert!(zone.local.contains_key(&RrsetKey::new("", "NS")));
+        assert!(zone.local.contains_key(&RrsetKey::new("new", "AAAA")));
     }
 }

@@ -11,10 +11,12 @@ categories = ["gui", "network-programming"]
 [dependencies]
 base64 = "0.23.1"
 desec = "0.0.2"
+domain = { version = "0.12.3", features = ["zonefile", "bytes"] }
 eframe = "0.37.0"
 hex = "0.4.3"
 ipnet = "2.12.2"
 keyring = { version = "4.2.0", features = ["apple-native-keyring-store"] }
+rfd = "0.18.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync"] }
 
 [profile.release]

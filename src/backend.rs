@@ -24,6 +24,14 @@ pub enum BackendCommand {
         minimum_ttl: u32,
         ops: Vec<DiffOp>,
     },
+    ExportServerZonefile {
+        domain: String,
+    },
+    PickZonefile,
+    SaveZonefile {
+        default_name: String,
+        content: String,
+    },
 }
 
 #[derive(Debug)]
@@ -45,6 +53,19 @@ pub enum BackendEvent {
         applied_count: usize,
         rrsets: BTreeMap<RrsetKey, RrsetData>,
     },
+    ServerZonefileLoaded {
+        domain: String,
+        content: String,
+    },
+    ZonefilePicked {
+        filename: String,
+        content: String,
+    },
+    ZonefilePickCancelled,
+    ZonefileSaved {
+        filename: String,
+    },
+    ZonefileSaveCancelled,
     Error {
         context: String,
         message: String,
@@ -94,22 +115,55 @@ async fn worker_loop(
     let mut client: Option<Client> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
-        let event = match cmd {
-            BackendCommand::Connect { token } => handle_connect(&mut client, &token).await,
-            BackendCommand::FetchDomains => handle_fetch_domains(client.as_ref()).await,
-            BackendCommand::FetchZone {
-                domain,
-                minimum_ttl,
-            } => handle_fetch_zone(client.as_ref(), domain, minimum_ttl).await,
-            BackendCommand::ApplyChanges {
-                domain,
-                minimum_ttl,
-                ops,
-            } => handle_apply_changes(client.as_ref(), domain, minimum_ttl, ops).await,
-        };
+        match cmd {
+            BackendCommand::PickZonefile => {
+                let tx = event_tx.clone();
+                let ctx_clone = ctx.clone();
+                tokio::spawn(async move {
+                    let event = handle_pick_zonefile().await;
+                    let _ = tx.send(event);
+                    ctx_clone.request_repaint();
+                });
+                continue;
+            }
+            BackendCommand::SaveZonefile {
+                default_name,
+                content,
+            } => {
+                let tx = event_tx.clone();
+                let ctx_clone = ctx.clone();
+                tokio::spawn(async move {
+                    let event = handle_save_zonefile(default_name, content).await;
+                    let _ = tx.send(event);
+                    ctx_clone.request_repaint();
+                });
+                continue;
+            }
+            other => {
+                let event = match other {
+                    BackendCommand::Connect { token } => handle_connect(&mut client, &token).await,
+                    BackendCommand::FetchDomains => handle_fetch_domains(client.as_ref()).await,
+                    BackendCommand::FetchZone {
+                        domain,
+                        minimum_ttl,
+                    } => handle_fetch_zone(client.as_ref(), domain, minimum_ttl).await,
+                    BackendCommand::ApplyChanges {
+                        domain,
+                        minimum_ttl,
+                        ops,
+                    } => handle_apply_changes(client.as_ref(), domain, minimum_ttl, ops).await,
+                    BackendCommand::ExportServerZonefile { domain } => {
+                        handle_export_server_zonefile(client.as_ref(), domain).await
+                    }
+                    BackendCommand::PickZonefile | BackendCommand::SaveZonefile { .. } => {
+                        unreachable!()
+                    }
+                };
 
-        let _ = event_tx.send(event);
-        ctx.request_repaint();
+                let _ = event_tx.send(event);
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -216,6 +270,63 @@ async fn handle_apply_changes(
                 "Changes were applied to deSEC, but refreshing failed: {}",
                 format_desec_error(&err, None)
             ),
+        },
+    }
+}
+
+async fn handle_export_server_zonefile(client: Option<&Client>, domain: String) -> BackendEvent {
+    let Some(client) = client else {
+        return not_connected_error(&format!("Export {domain}"));
+    };
+
+    match client.domains().zonefile(&domain).await {
+        Ok(content) => BackendEvent::ServerZonefileLoaded { domain, content },
+        Err(err) => BackendEvent::Error {
+            context: format!("Export {domain}"),
+            message: format_desec_error(&err, None),
+        },
+    }
+}
+
+async fn handle_pick_zonefile() -> BackendEvent {
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Import Zonefile");
+    #[cfg(not(target_os = "macos"))]
+    {
+        dialog = dialog
+            .add_filter("Zone files", &["zone", "txt", "db"])
+            .add_filter("All files", &["*"]);
+    }
+
+    let Some(file) = dialog.pick_file().await else {
+        return BackendEvent::ZonefilePickCancelled;
+    };
+
+    let filename = file.file_name();
+    let bytes = file.read().await;
+    match String::from_utf8(bytes) {
+        Ok(content) => BackendEvent::ZonefilePicked { filename, content },
+        Err(_) => BackendEvent::Error {
+            context: format!("Read {filename}"),
+            message: "Zonefile must be valid UTF-8 text.".to_owned(),
+        },
+    }
+}
+
+async fn handle_save_zonefile(default_name: String, content: String) -> BackendEvent {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title("Export Zonefile")
+        .set_file_name(&default_name);
+
+    let Some(file) = dialog.save_file().await else {
+        return BackendEvent::ZonefileSaveCancelled;
+    };
+
+    let filename = file.file_name();
+    match file.write(content.as_bytes()).await {
+        Ok(()) => BackendEvent::ZonefileSaved { filename },
+        Err(err) => BackendEvent::Error {
+            context: format!("Save {filename}"),
+            message: err.to_string(),
         },
     }
 }

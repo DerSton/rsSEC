@@ -12,6 +12,10 @@ use crate::ui::modals::{
 };
 use crate::ui::theme::{color_added, color_deleted, color_modified};
 use crate::ui::zone_table::render_zone_table;
+use crate::ui::zonefile_modal::{
+    ExportModalAction, ExportZoneModal, ImportModalAction, ImportZoneModal, render_export_modal,
+    render_import_modal,
+};
 
 #[derive(Debug, Clone)]
 enum PendingNavigation {
@@ -42,6 +46,8 @@ pub struct DesecApp {
     bulk_ttl_input: String,
 
     editor_modal: Option<RecordEditorModal>,
+    import_modal: Option<ImportZoneModal>,
+    export_modal: Option<ExportZoneModal>,
     show_review_modal: bool,
     show_about_modal: bool,
     pending_navigation: Option<PendingNavigation>,
@@ -93,6 +99,8 @@ impl DesecApp {
             selected_keys: BTreeSet::new(),
             bulk_ttl_input: "3600".to_owned(),
             editor_modal: None,
+            import_modal: None,
+            export_modal: None,
             show_review_modal: false,
             show_about_modal: false,
             pending_navigation: None,
@@ -106,6 +114,8 @@ impl DesecApp {
     fn has_open_modal(&self) -> bool {
         self.show_token_modal
             || self.editor_modal.is_some()
+            || self.import_modal.is_some()
+            || self.export_modal.is_some()
             || self.show_review_modal
             || self.show_about_modal
             || self.pending_navigation.is_some()
@@ -194,8 +204,57 @@ impl DesecApp {
                         format!("Applied {applied_count} to {domain} ({count} RRsets)");
                 }
 
+                BackendEvent::ServerZonefileLoaded { domain, content } => {
+                    if let Some(modal) = &mut self.export_modal
+                        && modal.domain == domain
+                    {
+                        modal.server_content = Some(content);
+                        modal.loading_server = false;
+                        modal.server_error = None;
+                    }
+                    self.status_message = format!("Loaded server zonefile for {domain}");
+                }
+
+                BackendEvent::ZonefilePicked { filename, content } => {
+                    if let Some(modal) = &mut self.import_modal {
+                        modal.set_file_content(filename.clone(), content);
+                    }
+                    self.status_message = format!("Loaded {filename}");
+                }
+
+                BackendEvent::ZonefilePickCancelled => {
+                    if let Some(modal) = &mut self.import_modal {
+                        modal.dialog_open = false;
+                    }
+                }
+
+                BackendEvent::ZonefileSaved { filename } => {
+                    if let Some(modal) = &mut self.export_modal {
+                        modal.dialog_open = false;
+                    }
+                    self.export_modal = None;
+                    self.error_banner = None;
+                    self.status_message = format!("Exported {filename}");
+                }
+
+                BackendEvent::ZonefileSaveCancelled => {
+                    if let Some(modal) = &mut self.export_modal {
+                        modal.dialog_open = false;
+                    }
+                }
+
                 BackendEvent::Error { context, message } => {
                     self.busy_label = None;
+                    if let Some(modal) = &mut self.import_modal {
+                        modal.dialog_open = false;
+                    }
+                    if let Some(modal) = &mut self.export_modal {
+                        modal.dialog_open = false;
+                        if modal.loading_server {
+                            modal.loading_server = false;
+                            modal.server_error = Some(message.clone());
+                        }
+                    }
                     self.error_banner = Some(format!("{context}: {message}"));
                     self.status_message = format!("{context} failed");
                     if !self.connected {
@@ -258,6 +317,19 @@ impl DesecApp {
 
                     if ui.button("Fetch").clicked() {
                         self.request_navigation(PendingNavigation::RefreshZone);
+                    }
+                });
+
+                let has_zone = self.zone.is_some();
+                ui.add_enabled_ui(has_zone && !blocked, |ui| {
+                    ui.separator();
+                    if ui.button("Import").clicked() {
+                        self.import_modal = Some(ImportZoneModal::new());
+                    }
+                    if ui.button("Export").clicked()
+                        && let Some(zone) = &self.zone
+                    {
+                        self.export_modal = Some(ExportZoneModal::from_zone(zone));
                     }
                 });
 
@@ -568,6 +640,64 @@ impl DesecApp {
                     }
                 }
                 EditorOutcome::Cancelled => {}
+            }
+        }
+
+        if let (Some(mut modal), Some(zone)) = (self.import_modal.take(), self.zone.as_mut()) {
+            match render_import_modal(ctx, &mut modal, zone) {
+                ImportModalAction::None => {
+                    self.import_modal = Some(modal);
+                }
+                ImportModalAction::PickFile => {
+                    self.import_modal = Some(modal);
+                    self.backend.send(BackendCommand::PickZonefile);
+                }
+                ImportModalAction::Confirm { rrsets, mode } => {
+                    match zone.apply_import_local(&rrsets, mode) {
+                        Ok(diff) => {
+                            self.selected_keys.clear();
+                            self.error_banner = None;
+                            self.status_message = format!(
+                                "Staged {} ({} RRsets: +{} ~{} -{}) — review and click Apply",
+                                mode.label(),
+                                rrsets.len(),
+                                diff.added,
+                                diff.modified,
+                                diff.deleted
+                            );
+                        }
+                        Err(err) => {
+                            self.error_banner = Some(err);
+                            self.import_modal = Some(modal);
+                        }
+                    }
+                }
+                ImportModalAction::Cancel => {}
+            }
+        }
+
+        if let Some(mut modal) = self.export_modal.take() {
+            match render_export_modal(ctx, &mut modal) {
+                ExportModalAction::None => {
+                    self.export_modal = Some(modal);
+                }
+                ExportModalAction::FetchServerZonefile => {
+                    let domain = modal.domain.clone();
+                    self.export_modal = Some(modal);
+                    self.backend
+                        .send(BackendCommand::ExportServerZonefile { domain });
+                }
+                ExportModalAction::SaveFile {
+                    default_name,
+                    content,
+                } => {
+                    self.export_modal = Some(modal);
+                    self.backend.send(BackendCommand::SaveZonefile {
+                        default_name,
+                        content,
+                    });
+                }
+                ExportModalAction::Close => {}
             }
         }
 
