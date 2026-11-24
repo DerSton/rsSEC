@@ -8,6 +8,7 @@ use domain::base::zonefile_fmt::{DisplayKind, ZonefileFmt};
 use domain::zonefile::inplace::{Entry, Zonefile};
 
 use crate::model::{RrsetData, RrsetKey};
+use crate::rdata::tokenize_rdata;
 
 /// Controls how imported RRsets are merged into the local working zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -152,16 +153,16 @@ pub fn parse_zonefile(
                     .data()
                     .display_zonefile(DisplayKind::Simple)
                     .to_string();
-                let rdata = normalize_at_origin_rdata(&key.rtype, raw_rdata);
+                let rdata = normalize_imported_rdata(&key.rtype, raw_rdata);
                 let ttl = record.ttl().as_secs();
 
                 match rrsets.get_mut(&key) {
                     Some(existing) => {
                         if existing.ttl != ttl {
                             existing.ttl = existing.ttl.min(ttl);
-                            conflicting_ttl_keys.insert(key);
+                            conflicting_ttl_keys.insert(key.clone());
                         }
-                        if !existing.records.contains(&rdata) {
+                        if !existing.contains_equivalent(&key.rtype, &rdata) {
                             existing.records.push(rdata);
                             record_count += 1;
                         }
@@ -228,6 +229,54 @@ pub fn parse_zonefile(
         warnings,
         record_count,
     })
+}
+
+/// Normalizes `domain`'s `DisplayKind::Simple` output into clean deSEC-compatible presentation
+/// format (expands `@.<origin>.`, lowercases hex/CAA tags, and fixes `domain`'s `nodefaultalpn`).
+fn normalize_imported_rdata(rtype: &str, rdata: String) -> String {
+    let rdata = normalize_at_origin_rdata(rtype, rdata);
+    match rtype {
+        "TLSA" | "SMIMEA" | "DS" | "CDS" | "DLV" => {
+            let mut tokens: Vec<String> = rdata.split_whitespace().map(str::to_owned).collect();
+            if tokens.len() >= 4 {
+                let hex_lower = tokens[3..].concat().to_ascii_lowercase();
+                tokens.truncate(3);
+                tokens.push(hex_lower);
+                return tokens.join(" ");
+            }
+            rdata
+        }
+        "SSHFP" => {
+            let mut tokens: Vec<String> = rdata.split_whitespace().map(str::to_owned).collect();
+            if tokens.len() >= 3 {
+                let hex_lower = tokens[2..].concat().to_ascii_lowercase();
+                tokens.truncate(2);
+                tokens.push(hex_lower);
+                return tokens.join(" ");
+            }
+            rdata
+        }
+        "CAA" => {
+            let mut tokens = tokenize_rdata(&rdata);
+            if tokens.len() >= 3 {
+                tokens[1] = tokens[1].to_ascii_lowercase();
+                return tokens.join(" ");
+            }
+            rdata
+        }
+        "HTTPS" | "SVCB" => {
+            let mut tokens = tokenize_rdata(&rdata);
+            let mut changed = false;
+            for tok in tokens.iter_mut().skip(2) {
+                if tok == "nodefaultalpn" {
+                    *tok = "no-default-alpn".to_owned();
+                    changed = true;
+                }
+            }
+            if changed { tokens.join(" ") } else { rdata }
+        }
+        _ => rdata,
+    }
 }
 
 /// `domain::zonefile::inplace` expands `@` to `$ORIGIN` for owner names, but treats a bare `@`
@@ -499,6 +548,39 @@ note       IN TXT "@.sub.example.com."
                 .unwrap()
                 .records,
             vec!["\"@.sub.example.com.\""]
+        );
+    }
+
+    #[test]
+    fn normalizes_imported_hex_caa_and_no_default_alpn() {
+        let input = r#"
+$ORIGIN example.com.
+$TTL 3600
+_443._tcp IN TLSA  3 1 1 DEADBEEF
+@         IN SSHFP 4 2 AABBCCDD
+@         IN CAA   0 ISSUE "letsencrypt.org"
+@         IN HTTPS 1 . alpn="h3" no-default-alpn
+"#;
+        let parsed = parse_zonefile(input, "example.com", 3600, true).unwrap();
+        assert_eq!(
+            parsed
+                .rrsets
+                .get(&RrsetKey::new("_443._tcp", "TLSA"))
+                .unwrap()
+                .records,
+            vec!["3 1 1 deadbeef"]
+        );
+        assert_eq!(
+            parsed.rrsets.get(&RrsetKey::new("", "SSHFP")).unwrap().records,
+            vec!["4 2 aabbccdd"]
+        );
+        assert_eq!(
+            parsed.rrsets.get(&RrsetKey::new("", "CAA")).unwrap().records,
+            vec!["0 issue \"letsencrypt.org\""]
+        );
+        assert_eq!(
+            parsed.rrsets.get(&RrsetKey::new("", "HTTPS")).unwrap().records,
+            vec!["1 . alpn=h3 no-default-alpn"]
         );
     }
 }

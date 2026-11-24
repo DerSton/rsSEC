@@ -645,7 +645,7 @@ fn unquote_txt(input: &str) -> String {
 }
 
 /// Splits a BIND RDATA line into whitespace-delimited tokens while keeping quoted segments together.
-fn tokenize_rdata(input: &str) -> Vec<String> {
+pub(crate) fn tokenize_rdata(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -674,4 +674,584 @@ fn tokenize_rdata(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+/// Returns a DNS-canonical representation of an RDATA string for equivalence diffing.
+///
+/// Purely cosmetic presentation differences (e.g. hex/hostname/IPv6 casing, whitespace in
+/// hex/Base64, RFC 9460 SvcParam ordering and quoting, redundant BIND escapes inside quotes)
+/// normalize to the same string, while DNS-significant ordering (such as multi-chunk `TXT`/`SPF`
+/// strings, `ALPN` preference order, and `APL` prefix order) is strictly preserved.
+pub fn canonical_record(rtype: &str, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    match rtype.trim().to_ascii_uppercase().as_str() {
+        "A" => Ipv4Addr::from_str(trimmed)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| trimmed.to_owned()),
+        "AAAA" => Ipv6Addr::from_str(trimmed)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| trimmed.to_owned()),
+        "CNAME" | "DNAME" | "NS" | "PTR" => canonicalize_fqdn(trimmed),
+        "MX" | "KX" | "AFSDB" | "LP" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 2 {
+                format!(
+                    "{} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_fqdn(&tokens[1])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "SRV" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 4 {
+                format!(
+                    "{} {} {} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_u16(&tokens[1]),
+                    canonicalize_u16(&tokens[2]),
+                    canonicalize_fqdn(&tokens[3])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "RP" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 2 {
+                format!(
+                    "{} {}",
+                    canonicalize_fqdn(&tokens[0]),
+                    canonicalize_fqdn(&tokens[1])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "TXT" | "SPF" => {
+            let tokens = tokenize_rdata(trimmed);
+            tokens
+                .iter()
+                .map(|t| canonicalize_single_charstr(t))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        "CAA" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 3 {
+                let value = tokens[2..].join(" ");
+                format!(
+                    "{} {} {}",
+                    canonicalize_u8(&tokens[0]),
+                    tokens[1].to_ascii_lowercase(),
+                    canonicalize_single_charstr(&value)
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "HTTPS" | "SVCB" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 2 {
+                let prio = canonicalize_u16(&tokens[0]);
+                let target = canonicalize_fqdn(&tokens[1]);
+                if tokens.len() == 2 {
+                    format!("{prio} {target}")
+                } else {
+                    format!("{prio} {target} {}", canonicalize_svcb_params(&tokens[2..]))
+                }
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "URI" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 3 {
+                format!(
+                    "{} {} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_u16(&tokens[1]),
+                    canonicalize_single_charstr(&tokens[2])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "TLSA" | "SMIMEA" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 4 {
+                format!(
+                    "{} {} {} {}",
+                    canonicalize_u8(&tokens[0]),
+                    canonicalize_u8(&tokens[1]),
+                    canonicalize_u8(&tokens[2]),
+                    canonicalize_hex(&tokens[3..])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "SSHFP" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 3 {
+                format!(
+                    "{} {} {}",
+                    canonicalize_u8(&tokens[0]),
+                    canonicalize_u8(&tokens[1]),
+                    canonicalize_hex(&tokens[2..])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "DS" | "CDS" | "DLV" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 4 {
+                format!(
+                    "{} {} {} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_u8(&tokens[1]),
+                    canonicalize_u8(&tokens[2]),
+                    canonicalize_hex(&tokens[3..])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "DNSKEY" | "CDNSKEY" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 4 {
+                format!(
+                    "{} {} {} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_u8(&tokens[1]),
+                    canonicalize_u8(&tokens[2]),
+                    canonicalize_base64(&tokens[3..])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "CERT" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() >= 4 {
+                format!(
+                    "{} {} {} {}",
+                    tokens[0].to_ascii_uppercase(),
+                    canonicalize_u16(&tokens[1]),
+                    canonicalize_u8(&tokens[2]),
+                    canonicalize_base64(&tokens[3..])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "OPENPGPKEY" | "DHCID" => canonicalize_base64(&tokenize_rdata(trimmed)),
+        "NAPTR" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 6 {
+                format!(
+                    "{} {} {} {} {} {}",
+                    canonicalize_u16(&tokens[0]),
+                    canonicalize_u16(&tokens[1]),
+                    canonicalize_single_charstr(&tokens[2]),
+                    canonicalize_single_charstr(&tokens[3]),
+                    canonicalize_single_charstr(&tokens[4]),
+                    canonicalize_fqdn(&tokens[5])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "HINFO" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 2 {
+                format!(
+                    "{} {}",
+                    canonicalize_single_charstr(&tokens[0]),
+                    canonicalize_single_charstr(&tokens[1])
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "EUI48" | "EUI64" => trimmed.replace(':', "-").to_ascii_lowercase(),
+        "L32" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 2 {
+                let ip = Ipv4Addr::from_str(&tokens[1])
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|_| tokens[1].clone());
+                format!("{} {ip}", canonicalize_u16(&tokens[0]))
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "L64" | "NID" => {
+            let tokens = tokenize_rdata(trimmed);
+            if tokens.len() == 2 {
+                format!(
+                    "{} {}",
+                    canonicalize_u16(&tokens[0]),
+                    tokens[1].to_ascii_lowercase()
+                )
+            } else {
+                tokens.join(" ")
+            }
+        }
+        "APL" => canonicalize_apl(&tokenize_rdata(trimmed)),
+        "LOC" => canonicalize_loc(&tokenize_rdata(trimmed)),
+        _ => tokenize_rdata(trimmed).join(" "),
+    }
+}
+
+/// Returns `true` if two RDATA presentation strings for `rtype` represent the same DNS record.
+pub fn records_equivalent(rtype: &str, a: &str, b: &str) -> bool {
+    a == b || canonical_record(rtype, a) == canonical_record(rtype, b)
+}
+
+/// Returns `true` if two editor field inputs of `kind` represent the same DNS field value.
+pub fn field_values_equivalent(kind: FieldKind, a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a == b {
+        return true;
+    }
+    match kind {
+        FieldKind::Ipv4 => Ipv4Addr::from_str(a).ok() == Ipv4Addr::from_str(b).ok() && Ipv4Addr::from_str(a).is_ok(),
+        FieldKind::Ipv6 => Ipv6Addr::from_str(a).ok() == Ipv6Addr::from_str(b).ok() && Ipv6Addr::from_str(a).is_ok(),
+        FieldKind::Fqdn | FieldKind::FqdnOrDot => canonicalize_fqdn(a) == canonicalize_fqdn(b),
+        FieldKind::U8 => a.parse::<u8>().ok().is_some_and(|n| b.parse::<u8>().ok() == Some(n)),
+        FieldKind::U16 => a.parse::<u16>().ok().is_some_and(|n| b.parse::<u16>().ok() == Some(n)),
+        FieldKind::Hex => {
+            let ca: String = a.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            let cb: String = b.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            ca.eq_ignore_ascii_case(&cb)
+        }
+        FieldKind::Base64 => {
+            let ca: String = a.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            let cb: String = b.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            ca == cb
+        }
+        FieldKind::QuotedText => {
+            let qa = quote_txt(a);
+            let qb = quote_txt(b);
+            canonical_record("TXT", &qa) == canonical_record("TXT", &qb)
+        }
+        FieldKind::CaaTag | FieldKind::Hex64 | FieldKind::LocDirNS | FieldKind::LocDirEW => {
+            a.eq_ignore_ascii_case(b)
+        }
+        FieldKind::Eui48 | FieldKind::Eui64 => {
+            a.replace(':', "-").eq_ignore_ascii_case(&b.replace(':', "-"))
+        }
+        FieldKind::AplPrefixes => {
+            canonicalize_apl(&tokenize_rdata(a)) == canonicalize_apl(&tokenize_rdata(b))
+        }
+        FieldKind::SvcbParams => {
+            canonicalize_svcb_params(&tokenize_rdata(a))
+                == canonicalize_svcb_params(&tokenize_rdata(b))
+        }
+        FieldKind::LocLatDeg | FieldKind::LocLonDeg | FieldKind::LocMin => {
+            a.parse::<u8>().ok().is_some_and(|n| b.parse::<u8>().ok() == Some(n))
+        }
+        FieldKind::LocSec => a.parse::<f64>().ok().is_some_and(|va| {
+            b.parse::<f64>()
+                .ok()
+                .is_some_and(|vb| (va - vb).abs() < 1e-4)
+        }),
+        FieldKind::LocAlt => parse_loc_meters(a).is_some_and(|va| {
+            parse_loc_meters(b).is_some_and(|vb| (va - vb).abs() < 1e-3)
+        }),
+        FieldKind::LocSize => {
+            let fa: Option<Vec<f64>> = a.split_whitespace().map(parse_loc_meters).collect();
+            let fb: Option<Vec<f64>> = b.split_whitespace().map(parse_loc_meters).collect();
+            match (fa, fb) {
+                (Some(va), Some(vb)) if va.len() == vb.len() => va
+                    .iter()
+                    .zip(vb.iter())
+                    .all(|(x, y)| (x - y).abs() < 1e-3),
+                _ => false,
+            }
+        }
+        FieldKind::Raw => false,
+    }
+}
+
+fn canonicalize_fqdn(tok: &str) -> String {
+    tok.trim().to_ascii_lowercase()
+}
+
+fn canonicalize_u8(tok: &str) -> String {
+    tok.parse::<u8>()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| tok.to_owned())
+}
+
+fn canonicalize_u16(tok: &str) -> String {
+    tok.parse::<u16>()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| tok.to_owned())
+}
+
+fn canonicalize_hex(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn canonicalize_base64(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect()
+}
+
+fn canonicalize_single_charstr(token: &str) -> String {
+    encode_canonical_charstr(&decode_bind_charstr(token))
+}
+
+fn decode_bind_charstr(token: &str) -> Vec<u8> {
+    let inner = token
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(token);
+    let mut out = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut look = chars.clone();
+            let d1 = look.next().and_then(|ch| ch.to_digit(10));
+            let d2 = look.next().and_then(|ch| ch.to_digit(10));
+            let d3 = look.next().and_then(|ch| ch.to_digit(10));
+            if let (Some(a), Some(b), Some(d)) = (d1, d2, d3)
+                && let Ok(byte) = u8::try_from(a * 100 + b * 10 + d)
+            {
+                let _ = chars.next();
+                let _ = chars.next();
+                let _ = chars.next();
+                out.push(byte);
+            } else if let Some(next) = chars.next() {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(next.encode_utf8(&mut buf).as_bytes());
+            } else {
+                out.push(b'\\');
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+
+    out
+}
+
+fn encode_canonical_charstr(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &b in bytes {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => {
+                let _ = write!(out, "\\{b:03}");
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn canonicalize_svcb_key(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "key0" | "mandatory" => "mandatory".to_owned(),
+        "key1" | "alpn" => "alpn".to_owned(),
+        "key2" | "no-default-alpn" | "nodefaultalpn" => "no-default-alpn".to_owned(),
+        "key3" | "port" => "port".to_owned(),
+        "key4" | "ipv4hint" => "ipv4hint".to_owned(),
+        "key5" | "ech" => "ech".to_owned(),
+        "key6" | "ipv6hint" => "ipv6hint".to_owned(),
+        "key7" | "dohpath" => "dohpath".to_owned(),
+        "key8" | "ohttp" => "ohttp".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn canonicalize_svcb_params(tokens: &[String]) -> String {
+    let mut normalized: Vec<(String, String)> = tokens
+        .iter()
+        .map(|tok| {
+            let Some((raw_k, raw_v)) = tok.split_once('=') else {
+                let k = canonicalize_svcb_key(tok);
+                return (k.clone(), k);
+            };
+            let key = canonicalize_svcb_key(raw_k);
+            let decoded = decode_bind_charstr(raw_v);
+            let val_str = String::from_utf8_lossy(&decoded);
+
+            let canon_val = match key.as_str() {
+                "mandatory" => {
+                    let mut keys: Vec<String> = val_str
+                        .split(',')
+                        .map(|item| canonicalize_svcb_key(item.trim()))
+                        .collect();
+                    keys.sort_unstable();
+                    keys.join(",")
+                }
+                "port" => canonicalize_u16(val_str.trim()),
+                "ipv4hint" => val_str
+                    .split(',')
+                    .map(|item| {
+                        let t = item.trim();
+                        Ipv4Addr::from_str(t)
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|_| t.to_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "ipv6hint" => val_str
+                    .split(',')
+                    .map(|item| {
+                        let t = item.trim();
+                        Ipv6Addr::from_str(t)
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|_| t.to_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "ech" => val_str
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect(),
+                // Preserve ALPN list order (RFC 9460 §7.1.1 preference order) and opaque values.
+                _ => encode_canonical_charstr(&decoded),
+            };
+
+            (key.clone(), format!("{key}={canon_val}"))
+        })
+        .collect();
+
+    // RFC 9460 §2.2: SvcParams are unordered in presentation format (wire format sorts by key).
+    normalized.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    normalized
+        .into_iter()
+        .map(|(_, formatted)| formatted)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn canonicalize_apl(tokens: &[String]) -> String {
+    // RFC 3123 §4: Prefix order inside an APL record is DNS-significant; preserve order.
+    tokens
+        .iter()
+        .map(|item| {
+            let (neg, rest) = match item.strip_prefix('!') {
+                Some(r) => ("!", r),
+                None => ("", item.as_str()),
+            };
+            let Some((afi, net)) = rest.split_once(':') else {
+                return item.clone();
+            };
+            let normalized_net = match afi {
+                "1" => Ipv4Net::from_str(net)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| net.to_owned()),
+                "2" => Ipv6Net::from_str(net)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| net.to_owned()),
+                _ => net.to_owned(),
+            };
+            format!("{neg}{afi}:{normalized_net}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_loc_meters(tok: &str) -> Option<f64> {
+    tok.strip_suffix('m')
+        .or_else(|| tok.strip_suffix('M'))
+        .unwrap_or(tok)
+        .parse::<f64>()
+        .ok()
+}
+
+fn canonicalize_loc(tokens: &[String]) -> String {
+    let parse_coord =
+        |idx: &mut usize, dirs: [&'static str; 2]| -> Option<(u8, u8, f64, &'static str)> {
+        let deg: u8 = tokens.get(*idx)?.parse().ok()?;
+        *idx += 1;
+        let next = tokens.get(*idx)?;
+        if next.eq_ignore_ascii_case(dirs[0]) {
+            *idx += 1;
+            return Some((deg, 0, 0.0, dirs[0]));
+        }
+        if next.eq_ignore_ascii_case(dirs[1]) {
+            *idx += 1;
+            return Some((deg, 0, 0.0, dirs[1]));
+        }
+        let min: u8 = next.parse().ok()?;
+        *idx += 1;
+        let next = tokens.get(*idx)?;
+        if next.eq_ignore_ascii_case(dirs[0]) {
+            *idx += 1;
+            return Some((deg, min, 0.0, dirs[0]));
+        }
+        if next.eq_ignore_ascii_case(dirs[1]) {
+            *idx += 1;
+            return Some((deg, min, 0.0, dirs[1]));
+        }
+        let sec: f64 = next.parse().ok()?;
+        *idx += 1;
+        let dir_tok = tokens.get(*idx)?;
+        let dir = if dir_tok.eq_ignore_ascii_case(dirs[0]) {
+            dirs[0]
+        } else if dir_tok.eq_ignore_ascii_case(dirs[1]) {
+            dirs[1]
+        } else {
+            return None;
+        };
+        *idx += 1;
+        Some((deg, min, sec, dir))
+    };
+
+    let mut idx = 0;
+    let Some((lat_d, lat_m, lat_s, ns)) = parse_coord(&mut idx, ["N", "S"]) else {
+        return tokens.join(" ");
+    };
+    let Some((lon_d, lon_m, lon_s, ew)) = parse_coord(&mut idx, ["E", "W"]) else {
+        return tokens.join(" ");
+    };
+    let Some(alt) = tokens.get(idx).and_then(|t| parse_loc_meters(t)) else {
+        return tokens.join(" ");
+    };
+    idx += 1;
+    let size = tokens
+        .get(idx)
+        .and_then(|t| parse_loc_meters(t))
+        .unwrap_or(1.0);
+    let hp = tokens
+        .get(idx + 1)
+        .and_then(|t| parse_loc_meters(t))
+        .unwrap_or(10_000.0);
+    let vp = tokens
+        .get(idx + 2)
+        .and_then(|t| parse_loc_meters(t))
+        .unwrap_or(10.0);
+
+    format!(
+        "{lat_d} {lat_m} {lat_s:.3} {ns} {lon_d} {lon_m} {lon_s:.3} {ew} {alt:.2}m {size:.2}m {hp:.2}m {vp:.2}m"
+    )
 }

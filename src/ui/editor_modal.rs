@@ -4,8 +4,8 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::model::{RECORD_TYPES, RrsetData, RrsetKey, ZoneRow, ZoneState};
 use crate::rdata::{
-    FieldSpec, default_fields_for_type, parse_record_to_fields, schema_for_type,
-    validate_and_format,
+    FieldSpec, canonical_record, default_fields_for_type, field_values_equivalent,
+    parse_record_to_fields, records_equivalent, schema_for_type, validate_and_format,
 };
 use crate::ui::theme::{color_added, color_modified};
 
@@ -161,10 +161,37 @@ pub fn render_editor_modal(
                         .collect()
                 })
                 .unwrap_or_default();
+            let cloud_canonical: Vec<String> = cloud_entry
+                .map(|c| {
+                    c.records
+                        .iter()
+                        .map(|r| canonical_record(&active_type, r))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let row_matches = match_rows_to_cloud(
+                &active_type,
+                schema,
+                &modal.rows,
+                &cloud_rows,
+                &cloud_canonical,
+            );
+            let rows_differ = modal.rows.len() != cloud_rows.len()
+                || row_matches
+                    .iter()
+                    .any(|m| !matches!(m, CloudRowMatch::Exact));
 
             ui.separator();
 
-            render_record_cards(ui, modal, schema, cloud_entry.is_some(), &cloud_rows);
+            render_record_cards(
+                ui,
+                modal,
+                schema,
+                cloud_entry.is_some(),
+                &cloud_rows,
+                &row_matches,
+            );
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -173,7 +200,7 @@ pub fn render_editor_modal(
                 }
                 if let Some(c_entry) = cloud_entry {
                     let c_ttl = c_entry.ttl.to_string();
-                    if (modal.ttl_input.trim() != c_ttl || modal.rows != cloud_rows)
+                    if (modal.ttl_input.trim() != c_ttl || rows_differ)
                         && ui.button("Reset to Cloud").clicked()
                     {
                         modal.ttl_input = c_ttl;
@@ -298,12 +325,100 @@ fn styled_field_label(ui: &Ui, label: &str, modified: bool) -> RichText {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudRowMatch {
+    /// Canonically identical to an unmatched cloud record (regardless of row order).
+    Exact,
+    /// Paired with an unused cloud row for field-level modification highlights.
+    Modified(usize),
+    /// Truly new row with no corresponding cloud record.
+    Added,
+}
+
+/// Matches editor rows against cloud rows order-independently (RRsets are unordered sets).
+fn match_rows_to_cloud(
+    rtype: &str,
+    schema: &[FieldSpec],
+    local_rows: &[Vec<String>],
+    cloud_rows: &[Vec<String>],
+    cloud_canonical: &[String],
+) -> Vec<CloudRowMatch> {
+    let mut matches = vec![CloudRowMatch::Added; local_rows.len()];
+    if cloud_rows.is_empty() {
+        return matches;
+    }
+
+    let mut cloud_used = vec![false; cloud_rows.len()];
+
+    // Pass 1: exact DNS-canonical match in any order.
+    for (row_idx, row_fields) in local_rows.iter().enumerate() {
+        let local_canon = (row_fields.len() == schema.len())
+            .then(|| validate_and_format(rtype, row_fields).ok())
+            .flatten()
+            .map(|formatted| canonical_record(rtype, &formatted));
+
+        let found = cloud_rows.iter().enumerate().find(|(c_idx, c_row)| {
+            if cloud_used[*c_idx] {
+                return false;
+            }
+            if let (Some(lc), Some(cc)) = (local_canon.as_deref(), cloud_canonical.get(*c_idx))
+                && lc == cc
+            {
+                return true;
+            }
+            row_fields.len() == schema.len()
+                && c_row.len() == schema.len()
+                && schema
+                    .iter()
+                    .enumerate()
+                    .all(|(fi, spec)| field_values_equivalent(spec.kind, &row_fields[fi], &c_row[fi]))
+        });
+
+        if let Some((c_idx, _)) = found {
+            cloud_used[c_idx] = true;
+            matches[row_idx] = CloudRowMatch::Exact;
+        }
+    }
+
+    // Pass 2: pair remaining unmatched rows with the closest unused cloud row by shared fields.
+    for (row_idx, row_fields) in local_rows.iter().enumerate() {
+        if matches[row_idx] == CloudRowMatch::Exact {
+            continue;
+        }
+        let best = cloud_rows
+            .iter()
+            .enumerate()
+            .filter(|(c_idx, _)| !cloud_used[*c_idx])
+            .max_by_key(|(c_idx, c_row)| {
+                let shared = schema
+                    .iter()
+                    .enumerate()
+                    .filter(|(fi, spec)| {
+                        row_fields
+                            .get(*fi)
+                            .zip(c_row.get(*fi))
+                            .is_some_and(|(a, b)| field_values_equivalent(spec.kind, a, b))
+                    })
+                    .count();
+                (shared, usize::MAX - *c_idx)
+            });
+
+        if let Some((c_idx, _)) = best {
+            cloud_used[c_idx] = true;
+            matches[row_idx] = CloudRowMatch::Modified(c_idx);
+        }
+    }
+
+    matches
+}
+
 fn render_record_cards(
     ui: &mut Ui,
     modal: &mut RecordEditorModal,
     schema: &[FieldSpec],
     has_cloud_entry: bool,
     cloud_rows: &[Vec<String>],
+    row_matches: &[CloudRowMatch],
 ) {
     let mut remove_idx: Option<usize> = None;
     let can_remove = modal.rows.len() > 1;
@@ -318,7 +433,10 @@ fn render_record_cards(
                 if row_fields.len() != schema.len() {
                     row_fields.resize(schema.len(), String::new());
                 }
-                let cloud_row = cloud_rows.get(row_idx).map(Vec::as_slice);
+                let row_match = row_matches
+                    .get(row_idx)
+                    .copied()
+                    .unwrap_or(CloudRowMatch::Added);
 
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(card_min_width);
@@ -338,7 +456,8 @@ fn render_record_cards(
                         row_fields,
                         schema,
                         has_cloud_entry,
-                        cloud_row,
+                        cloud_rows,
+                        row_match,
                         is_single_line && can_remove,
                     ) {
                         remove_idx = Some(row_idx);
@@ -352,7 +471,8 @@ fn render_record_cards(
                             row_fields,
                             schema,
                             has_cloud_entry,
-                            cloud_row,
+                            cloud_rows,
+                            row_match,
                             can_remove,
                         ) {
                             remove_idx = Some(row_idx);
@@ -370,13 +490,15 @@ fn render_record_cards(
 }
 
 /// Renders one non-wrapping horizontal row of fields and returns `true` if `Remove` was clicked.
+#[allow(clippy::too_many_arguments)]
 fn render_field_line(
     ui: &mut Ui,
     range: Range<usize>,
     row_fields: &mut [String],
     schema: &[FieldSpec],
     has_cloud_entry: bool,
-    cloud_row: Option<&[String]>,
+    cloud_rows: &[Vec<String>],
+    row_match: CloudRowMatch,
     show_remove_btn: bool,
 ) -> bool {
     let last_in_line = range.end.saturating_sub(1);
@@ -386,8 +508,15 @@ fn render_field_line(
         for field_idx in range {
             let spec = &schema[field_idx];
             let field_val = &mut row_fields[field_idx];
-            let diff_color =
-                field_diff_color(ui, field_val.trim(), field_idx, has_cloud_entry, cloud_row);
+            let diff_color = field_diff_color(
+                ui,
+                spec,
+                field_val.trim(),
+                field_idx,
+                has_cloud_entry,
+                cloud_rows,
+                row_match,
+            );
 
             let label_text = match diff_color {
                 Some(col) => RichText::new(spec.label).color(col).strong(),
@@ -423,21 +552,25 @@ fn render_field_line(
 
 fn field_diff_color(
     ui: &Ui,
+    spec: &FieldSpec,
     trimmed_val: &str,
     field_idx: usize,
     has_cloud_entry: bool,
-    cloud_row: Option<&[String]>,
+    cloud_rows: &[Vec<String>],
+    row_match: CloudRowMatch,
 ) -> Option<Color32> {
     if !has_cloud_entry {
         return (!trimmed_val.is_empty()).then(|| color_added(ui));
     }
-    if let Some(c_row) = cloud_row {
-        return c_row
-            .get(field_idx)
-            .is_some_and(|c_val| c_val != trimmed_val)
-            .then(|| color_modified(ui));
+    match row_match {
+        CloudRowMatch::Exact => None,
+        CloudRowMatch::Modified(c_idx) => cloud_rows
+            .get(c_idx)
+            .and_then(|c_row| c_row.get(field_idx))
+            .is_some_and(|c_val| !field_values_equivalent(spec.kind, c_val, trimmed_val))
+            .then(|| color_modified(ui)),
+        CloudRowMatch::Added => (!trimmed_val.is_empty()).then(|| color_added(ui)),
     }
-    (!trimmed_val.is_empty()).then(|| color_added(ui))
 }
 
 fn apply_modal_to_zone(
@@ -459,11 +592,14 @@ fn apply_modal_to_zone(
         return Err("At least one row is required.".to_owned());
     }
 
-    let mut records = Vec::with_capacity(modal.rows.len());
+    let mut records: Vec<String> = Vec::with_capacity(modal.rows.len());
     for (idx, row_fields) in modal.rows.iter().enumerate() {
         match validate_and_format(&rtype, row_fields) {
             Ok(formatted) => {
-                if !records.contains(&formatted) {
+                if !records
+                    .iter()
+                    .any(|existing| records_equivalent(&rtype, existing, &formatted))
+                {
                     records.push(formatted);
                 }
             }
@@ -480,4 +616,43 @@ fn apply_modal_to_zone(
     let data = RrsetData::new(ttl, records);
     zone.upsert_local(modal.original_key.as_ref(), new_key.clone(), data)?;
     Ok(new_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_row_matching_ignores_rrset_order() {
+        let schema = schema_for_type("MX");
+        let cloud_raw = ["10 mail1.example.com.", "20 mail2.example.com."];
+        let cloud_rows: Vec<Vec<String>> = cloud_raw
+            .iter()
+            .map(|r| parse_record_to_fields("MX", r))
+            .collect();
+        let cloud_canonical: Vec<String> = cloud_raw
+            .iter()
+            .map(|r| canonical_record("MX", r))
+            .collect();
+
+        // Reversed order + different target casing -> both Exact.
+        let local_reordered = vec![
+            vec!["20".to_owned(), "Mail2.Example.COM.".to_owned()],
+            vec!["10".to_owned(), "mail1.example.com.".to_owned()],
+        ];
+        assert_eq!(
+            match_rows_to_cloud("MX", schema, &local_reordered, &cloud_rows, &cloud_canonical),
+            vec![CloudRowMatch::Exact, CloudRowMatch::Exact]
+        );
+
+        // Reversed order + one priority edited -> unchanged stays Exact, edited pairs with its row.
+        let local_edited = vec![
+            vec!["20".to_owned(), "mail2.example.com.".to_owned()],
+            vec!["15".to_owned(), "mail1.example.com.".to_owned()],
+        ];
+        assert_eq!(
+            match_rows_to_cloud("MX", schema, &local_edited, &cloud_rows, &cloud_canonical),
+            vec![CloudRowMatch::Exact, CloudRowMatch::Modified(0)]
+        );
+    }
 }

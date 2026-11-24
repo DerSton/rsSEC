@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::rdata::{canonical_record, records_equivalent};
 use crate::zonefile::{ImportMode, is_desec_managed_key, is_singleton_rtype};
 
 pub const RECORD_TYPES: &[&str] = &[
@@ -120,6 +121,26 @@ impl RrsetData {
         sorted.sort_unstable();
         sorted
     }
+
+    /// Returns the DNS-canonical set of records for `rtype` (RRsets are unordered per RFC 2181 §5).
+    pub fn canonical_records(&self, rtype: &str) -> BTreeSet<String> {
+        self.records
+            .iter()
+            .map(|r| canonical_record(rtype, r))
+            .collect()
+    }
+
+    /// Returns `true` if `self` and `other` have the same TTL and DNS-equivalent record sets.
+    pub fn is_equivalent(&self, rtype: &str, other: &Self) -> bool {
+        self.ttl == other.ttl && self.canonical_records(rtype) == other.canonical_records(rtype)
+    }
+
+    /// Returns `true` if `self.records` already contains a record DNS-equivalent to `candidate`.
+    pub fn contains_equivalent(&self, rtype: &str, candidate: &str) -> bool {
+        self.records
+            .iter()
+            .any(|existing| records_equivalent(rtype, existing, candidate))
+    }
 }
 
 impl PartialEq for RrsetData {
@@ -185,54 +206,7 @@ impl ZoneRow {
 
     /// Compares individual record values between cloud (`remote`) and working (`local`) state.
     pub fn record_diffs(&self) -> Vec<RecordValueDiff> {
-        match (&self.remote, &self.local) {
-            (None, Some(loc)) => loc
-                .records
-                .iter()
-                .map(|v| RecordValueDiff {
-                    kind: ValueDiffKind::Added,
-                    value: v.clone(),
-                })
-                .collect(),
-
-            (Some(rem), None) => rem
-                .records
-                .iter()
-                .map(|v| RecordValueDiff {
-                    kind: ValueDiffKind::Removed,
-                    value: v.clone(),
-                })
-                .collect(),
-
-            (Some(rem), Some(loc)) => {
-                let rem_set: BTreeSet<&str> = rem.records.iter().map(String::as_str).collect();
-                let loc_set: BTreeSet<&str> = loc.records.iter().map(String::as_str).collect();
-                let mut diffs = Vec::new();
-
-                for r in &rem.records {
-                    if !loc_set.contains(r.as_str()) {
-                        diffs.push(RecordValueDiff {
-                            kind: ValueDiffKind::Removed,
-                            value: r.clone(),
-                        });
-                    }
-                }
-                for l in &loc.records {
-                    let kind = if rem_set.contains(l.as_str()) {
-                        ValueDiffKind::Unchanged
-                    } else {
-                        ValueDiffKind::Added
-                    };
-                    diffs.push(RecordValueDiff {
-                        kind,
-                        value: l.clone(),
-                    });
-                }
-                diffs
-            }
-
-            (None, None) => Vec::new(),
-        }
+        diff_records(&self.key.rtype, self.remote.as_ref(), self.local.as_ref())
     }
 
     pub fn matches_filter(&self, query_lower: &str, type_filter: &str, changes_only: bool) -> bool {
@@ -346,7 +320,7 @@ impl ZoneState {
             .into_iter()
             .filter_map(|key| match (self.remote.get(&key), self.local.get(&key)) {
                 (Some(rem), Some(loc)) => {
-                    let status = if rem == loc {
+                    let status = if rem.is_equivalent(&key.rtype, loc) {
                         RowStatus::Synced
                     } else {
                         RowStatus::Modified
@@ -383,11 +357,13 @@ impl ZoneState {
                     key,
                     data: new.clone(),
                 }),
-                (Some(old), Some(new)) if old != new => ops.push(DiffOp::Update {
-                    key,
-                    old: old.clone(),
-                    new: new.clone(),
-                }),
+                (Some(old), Some(new)) if !old.is_equivalent(&key.rtype, new) => {
+                    ops.push(DiffOp::Update {
+                        key,
+                        old: old.clone(),
+                        new: new.clone(),
+                    })
+                }
                 (Some(old), None) => ops.push(DiffOp::Delete {
                     key,
                     old: old.clone(),
@@ -530,7 +506,7 @@ impl ZoneState {
                         next.insert(key.clone(), data.clone());
                     } else if let Some(existing) = next.get_mut(key) {
                         for record in &data.records {
-                            if !existing.records.contains(record) {
+                            if !existing.contains_equivalent(&key.rtype, record) {
                                 existing.records.push(record.clone());
                             }
                         }
@@ -614,6 +590,62 @@ impl ZoneState {
     }
 }
 
+/// Order-insensitive, DNS-canonical diff between remote and local records of an RRset.
+pub fn diff_records(
+    rtype: &str,
+    remote: Option<&RrsetData>,
+    local: Option<&RrsetData>,
+) -> Vec<RecordValueDiff> {
+    match (remote, local) {
+        (None, Some(loc)) => loc
+            .records
+            .iter()
+            .map(|v| RecordValueDiff {
+                kind: ValueDiffKind::Added,
+                value: v.clone(),
+            })
+            .collect(),
+
+        (Some(rem), None) => rem
+            .records
+            .iter()
+            .map(|v| RecordValueDiff {
+                kind: ValueDiffKind::Removed,
+                value: v.clone(),
+            })
+            .collect(),
+
+        (Some(rem), Some(loc)) => {
+            let rem_set = rem.canonical_records(rtype);
+            let loc_set = loc.canonical_records(rtype);
+            let mut diffs = Vec::new();
+
+            for r in &rem.records {
+                if !loc_set.contains(&canonical_record(rtype, r)) {
+                    diffs.push(RecordValueDiff {
+                        kind: ValueDiffKind::Removed,
+                        value: r.clone(),
+                    });
+                }
+            }
+            for l in &loc.records {
+                let kind = if rem_set.contains(&canonical_record(rtype, l)) {
+                    ValueDiffKind::Unchanged
+                } else {
+                    ValueDiffKind::Added
+                };
+                diffs.push(RecordValueDiff {
+                    kind,
+                    value: l.clone(),
+                });
+            }
+            diffs
+        }
+
+        (None, None) => Vec::new(),
+    }
+}
+
 pub fn diff_summary_between(
     base: &BTreeMap<RrsetKey, RrsetData>,
     target: &BTreeMap<RrsetKey, RrsetData>,
@@ -626,7 +658,7 @@ pub fn diff_summary_between(
     for key in keys {
         match (base.get(key), target.get(key)) {
             (None, Some(_)) => summary.added += 1,
-            (Some(old), Some(new)) if old != new => summary.modified += 1,
+            (Some(old), Some(new)) if !old.is_equivalent(&key.rtype, new) => summary.modified += 1,
             (Some(_), None) => summary.deleted += 1,
             _ => {}
         }
@@ -744,5 +776,200 @@ mod tests {
         assert!(!zone.local.contains_key(&RrsetKey::new("old", "A")));
         assert!(zone.local.contains_key(&RrsetKey::new("", "NS")));
         assert!(zone.local.contains_key(&RrsetKey::new("new", "AAAA")));
+    }
+
+    #[test]
+    fn reordered_records_and_equivalent_presentation_produce_no_diff() {
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            RrsetKey::new("", "A"),
+            RrsetData::new(3600, vec!["192.0.2.1".to_owned(), "192.0.2.2".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("", "MX"),
+            RrsetData::new(
+                3600,
+                vec![
+                    "10 mail1.example.com.".to_owned(),
+                    "20 mail2.example.com.".to_owned(),
+                ],
+            ),
+        );
+        remote.insert(
+            RrsetKey::new("", "TXT"),
+            RrsetData::new(
+                3600,
+                vec![
+                    "\"v=spf1 -all\"".to_owned(),
+                    "\"v=DKIM1\\; k=rsa\"".to_owned(),
+                ],
+            ),
+        );
+        remote.insert(
+            RrsetKey::new("_443._tcp", "TLSA"),
+            RrsetData::new(3600, vec!["3 1 1 deadbeef".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("", "HTTPS"),
+            RrsetData::new(
+                3600,
+                vec!["1 . alpn=\"h2,h3\" ipv4hint=\"192.0.2.1\" mandatory=alpn,ipv4hint".to_owned()],
+            ),
+        );
+        remote.insert(
+            RrsetKey::new("", "AAAA"),
+            RrsetData::new(3600, vec!["2001:db8::1".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("", "CAA"),
+            RrsetData::new(3600, vec!["0 issue \"letsencrypt.org\"".to_owned()]),
+        );
+
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, remote);
+
+        // Same content with reversed record order and different presentation formats.
+        let mut imported = BTreeMap::new();
+        imported.insert(
+            RrsetKey::new("", "A"),
+            RrsetData::new(3600, vec!["192.0.2.2".to_owned(), "192.0.2.1".to_owned()]),
+        );
+        imported.insert(
+            RrsetKey::new("", "MX"),
+            RrsetData::new(
+                3600,
+                vec![
+                    "20 Mail2.Example.COM.".to_owned(),
+                    "10 MAIL1.EXAMPLE.COM.".to_owned(),
+                ],
+            ),
+        );
+        imported.insert(
+            RrsetKey::new("", "TXT"),
+            RrsetData::new(
+                3600,
+                vec![
+                    "\"v=DKIM1; k=rsa\"".to_owned(),
+                    "\"v=spf1 -all\"".to_owned(),
+                ],
+            ),
+        );
+        imported.insert(
+            RrsetKey::new("_443._tcp", "TLSA"),
+            RrsetData::new(3600, vec!["3 1 1 DEADBEEF".to_owned()]),
+        );
+        imported.insert(
+            RrsetKey::new("", "HTTPS"),
+            RrsetData::new(
+                3600,
+                vec!["1 . mandatory=ipv4hint,alpn ipv4hint=192.0.2.1 alpn=h2,h3".to_owned()],
+            ),
+        );
+        imported.insert(
+            RrsetKey::new("", "AAAA"),
+            RrsetData::new(3600, vec!["2001:0DB8:0000:0000:0000:0000:0000:0001".to_owned()]),
+        );
+        imported.insert(
+            RrsetKey::new("", "CAA"),
+            RrsetData::new(3600, vec!["0 ISSUE \"letsencrypt.org\"".to_owned()]),
+        );
+
+        let preview = zone.preview_import(&imported, ImportMode::Replace);
+        assert!(preview.is_empty(), "expected no diff, got {preview:?}");
+
+        let applied = zone
+            .apply_import_local(&imported, ImportMode::Replace)
+            .unwrap();
+        assert!(applied.is_empty());
+        assert!(zone.diff().is_empty());
+        assert!(zone.rows().iter().all(|r| r.status == RowStatus::Synced));
+        for row in zone.rows() {
+            assert!(
+                row.record_diffs()
+                    .iter()
+                    .all(|d| d.kind == ValueDiffKind::Unchanged),
+                "unexpected record diff on {} {}: {:?}",
+                row.key.display_subname(),
+                row.key.rtype,
+                row.record_diffs()
+            );
+        }
+    }
+
+    #[test]
+    fn dns_significant_ordering_still_produces_diff() {
+        // 1. Multi-chunk TXT order is DNS-significant.
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            RrsetKey::new("_dkim", "TXT"),
+            RrsetData::new(3600, vec!["\"part1\" \"part2\"".to_owned()]),
+        );
+        // 2. HTTPS ALPN protocol list order is preference-ordered (RFC 9460 §7.1.1).
+        remote.insert(
+            RrsetKey::new("", "HTTPS"),
+            RrsetData::new(3600, vec!["1 . alpn=h2,h3".to_owned()]),
+        );
+        // 3. APL prefix order is DNS-significant (RFC 3123 §4).
+        remote.insert(
+            RrsetKey::new("acl", "APL"),
+            RrsetData::new(3600, vec!["1:192.0.2.0/24 !1:192.0.2.1/32".to_owned()]),
+        );
+
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, remote);
+
+        let mut imported = BTreeMap::new();
+        imported.insert(
+            RrsetKey::new("_dkim", "TXT"),
+            RrsetData::new(3600, vec!["\"part2\" \"part1\"".to_owned()]),
+        );
+        imported.insert(
+            RrsetKey::new("", "HTTPS"),
+            RrsetData::new(3600, vec!["1 . alpn=h3,h2".to_owned()]),
+        );
+        imported.insert(
+            RrsetKey::new("acl", "APL"),
+            RrsetData::new(3600, vec!["!1:192.0.2.1/32 1:192.0.2.0/24".to_owned()]),
+        );
+
+        let summary = zone
+            .apply_import_local(&imported, ImportMode::MergeUpdate)
+            .unwrap();
+        assert_eq!(
+            summary,
+            DiffSummary {
+                added: 0,
+                modified: 3,
+                deleted: 0,
+            }
+        );
+        assert_eq!(zone.diff().len(), 3);
+    }
+
+    #[test]
+    fn merge_append_skips_canonically_equivalent_duplicates() {
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            RrsetKey::new("_443._tcp", "TLSA"),
+            RrsetData::new(3600, vec!["3 1 1 deadbeef".to_owned()]),
+        );
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, remote);
+
+        let mut imported = BTreeMap::new();
+        imported.insert(
+            RrsetKey::new("_443._tcp", "TLSA"),
+            RrsetData::new(3600, vec!["3 1 1 DEADBEEF".to_owned()]),
+        );
+
+        let summary = zone
+            .apply_import_local(&imported, ImportMode::MergeAppend)
+            .unwrap();
+        assert!(summary.is_empty());
+        assert_eq!(
+            zone.local
+                .get(&RrsetKey::new("_443._tcp", "TLSA"))
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
     }
 }
