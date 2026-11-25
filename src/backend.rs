@@ -1,25 +1,37 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use desec::api::rrsets::{BulkPatch, Rrset};
 use desec::{Client, Error as DesecError, RecordType, Subname};
 use eframe::egui;
+use tokio::sync::RwLock;
 
 use crate::model::{DiffOp, DomainSummary, RrsetData, RrsetKey};
+
+type ClientsMap = Arc<RwLock<HashMap<String, Client>>>;
 
 #[derive(Debug)]
 pub enum BackendCommand {
     Connect {
+        account_id: String,
         token: String,
     },
-    FetchDomains,
+    Disconnect {
+        account_id: String,
+    },
+    FetchDomains {
+        account_id: String,
+    },
     FetchZone {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
     },
     ApplyChanges {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         ops: Vec<DiffOp>,
@@ -29,23 +41,29 @@ pub enum BackendCommand {
 #[derive(Debug)]
 pub enum BackendEvent {
     Connected {
+        account_id: String,
+        email: Option<String>,
         domains: Vec<DomainSummary>,
     },
     DomainsLoaded {
+        account_id: String,
         domains: Vec<DomainSummary>,
     },
     ZoneLoaded {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         rrsets: BTreeMap<RrsetKey, RrsetData>,
     },
     ChangesApplied {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         applied_count: usize,
         rrsets: BTreeMap<RrsetKey, RrsetData>,
     },
     Error {
+        account_id: String,
         context: String,
         message: String,
     },
@@ -91,33 +109,56 @@ async fn worker_loop(
     event_tx: Sender<BackendEvent>,
     ctx: egui::Context,
 ) {
-    let mut client: Option<Client> = None;
+    let clients: ClientsMap = Arc::new(RwLock::new(HashMap::new()));
 
     while let Ok(cmd) = cmd_rx.recv() {
-        let event = match cmd {
-            BackendCommand::Connect { token } => handle_connect(&mut client, &token).await,
-            BackendCommand::FetchDomains => handle_fetch_domains(client.as_ref()).await,
-            BackendCommand::FetchZone {
-                domain,
-                minimum_ttl,
-            } => handle_fetch_zone(client.as_ref(), domain, minimum_ttl).await,
-            BackendCommand::ApplyChanges {
-                domain,
-                minimum_ttl,
-                ops,
-            } => handle_apply_changes(client.as_ref(), domain, minimum_ttl, ops).await,
-        };
+        if let BackendCommand::Disconnect { account_id } = cmd {
+            clients.write().await.remove(&account_id);
+            continue;
+        }
 
-        let _ = event_tx.send(event);
-        ctx.request_repaint();
+        let clients = Arc::clone(&clients);
+        let event_tx = event_tx.clone();
+        let ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            let event = match cmd {
+                BackendCommand::Connect { account_id, token } => {
+                    handle_connect(&clients, account_id, &token).await
+                }
+                BackendCommand::FetchDomains { account_id } => {
+                    handle_fetch_domains(&clients, account_id).await
+                }
+                BackendCommand::FetchZone {
+                    account_id,
+                    domain,
+                    minimum_ttl,
+                } => handle_fetch_zone(&clients, account_id, domain, minimum_ttl).await,
+                BackendCommand::ApplyChanges {
+                    account_id,
+                    domain,
+                    minimum_ttl,
+                    ops,
+                } => handle_apply_changes(&clients, account_id, domain, minimum_ttl, ops).await,
+                BackendCommand::Disconnect { .. } => unreachable!(),
+            };
+
+            let _ = event_tx.send(event);
+            ctx.request_repaint();
+        });
     }
 }
 
-async fn handle_connect(client_slot: &mut Option<Client>, token: &str) -> BackendEvent {
+async fn get_client(clients: &ClientsMap, account_id: &str) -> Option<Client> {
+    clients.read().await.get(account_id).cloned()
+}
+
+async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -> BackendEvent {
     let new_client = match Client::new(token.trim()) {
         Ok(c) => c,
         Err(err) => {
             return BackendEvent::Error {
+                account_id,
                 context: "Connect".to_owned(),
                 message: err.to_string(),
             };
@@ -126,24 +167,36 @@ async fn handle_connect(client_slot: &mut Option<Client>, token: &str) -> Backen
 
     match fetch_domains(&new_client).await {
         Ok(domains) => {
-            *client_slot = Some(new_client);
-            BackendEvent::Connected { domains }
+            // `GET /auth/account/` requires `perm_manage_tokens`; scoped DNS tokens return 403,
+            // so treat account metadata lookup as best-effort and fall back cleanly.
+            let email = new_client.account().get().await.ok().map(|acc| acc.email);
+            clients.write().await.insert(account_id.clone(), new_client);
+            BackendEvent::Connected {
+                account_id,
+                email,
+                domains,
+            }
         }
         Err(err) => BackendEvent::Error {
+            account_id,
             context: "Connect".to_owned(),
             message: format_desec_error(&err, None),
         },
     }
 }
 
-async fn handle_fetch_domains(client: Option<&Client>) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error("Fetch domains");
+async fn handle_fetch_domains(clients: &ClientsMap, account_id: String) -> BackendEvent {
+    let Some(client) = get_client(clients, &account_id).await else {
+        return not_connected_error(account_id, "Fetch domains");
     };
 
-    match fetch_domains(client).await {
-        Ok(domains) => BackendEvent::DomainsLoaded { domains },
+    match fetch_domains(&client).await {
+        Ok(domains) => BackendEvent::DomainsLoaded {
+            account_id,
+            domains,
+        },
         Err(err) => BackendEvent::Error {
+            account_id,
             context: "Fetch domains".to_owned(),
             message: format_desec_error(&err, None),
         },
@@ -151,21 +204,24 @@ async fn handle_fetch_domains(client: Option<&Client>) -> BackendEvent {
 }
 
 async fn handle_fetch_zone(
-    client: Option<&Client>,
+    clients: &ClientsMap,
+    account_id: String,
     domain: String,
     minimum_ttl: u32,
 ) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error(&format!("Fetch {domain}"));
+    let Some(client) = get_client(clients, &account_id).await else {
+        return not_connected_error(account_id, &format!("Fetch {domain}"));
     };
 
-    match fetch_rrsets(client, &domain).await {
+    match fetch_rrsets(&client, &domain).await {
         Ok(rrsets) => BackendEvent::ZoneLoaded {
+            account_id,
             domain,
             minimum_ttl,
             rrsets,
         },
         Err(err) => BackendEvent::Error {
+            account_id,
             context: format!("Fetch {domain}"),
             message: format_desec_error(&err, None),
         },
@@ -173,13 +229,14 @@ async fn handle_fetch_zone(
 }
 
 async fn handle_apply_changes(
-    client: Option<&Client>,
+    clients: &ClientsMap,
+    account_id: String,
     domain: String,
     minimum_ttl: u32,
     ops: Vec<DiffOp>,
 ) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error(&format!("Apply {domain}"));
+    let Some(client) = get_client(clients, &account_id).await else {
+        return not_connected_error(account_id, &format!("Apply {domain}"));
     };
 
     let mut patches = Vec::with_capacity(ops.len());
@@ -188,6 +245,7 @@ async fn handle_apply_changes(
             Ok(patch) => patches.push(patch),
             Err(message) => {
                 return BackendEvent::Error {
+                    account_id,
                     context: format!("Apply {domain}"),
                     message,
                 };
@@ -197,20 +255,23 @@ async fn handle_apply_changes(
 
     if let Err(err) = client.rrsets(&domain).patch_bulk(&patches).await {
         return BackendEvent::Error {
+            account_id,
             context: format!("Apply {domain}"),
             message: format_desec_error(&err, Some(&ops)),
         };
     }
 
     let applied_count = ops.len();
-    match fetch_rrsets(client, &domain).await {
+    match fetch_rrsets(&client, &domain).await {
         Ok(rrsets) => BackendEvent::ChangesApplied {
+            account_id,
             domain,
             minimum_ttl,
             applied_count,
             rrsets,
         },
         Err(err) => BackendEvent::Error {
+            account_id,
             context: format!("Refresh {domain}"),
             message: format!(
                 "Changes were applied to deSEC, but refreshing failed: {}",
@@ -239,8 +300,9 @@ fn build_bulk_patch(op: &DiffOp) -> Result<BulkPatch, String> {
     Ok(patch)
 }
 
-fn not_connected_error(context: &str) -> BackendEvent {
+fn not_connected_error(account_id: String, context: &str) -> BackendEvent {
     BackendEvent::Error {
+        account_id,
         context: context.to_owned(),
         message: "Not connected. Configure an API token first.".to_owned(),
     }

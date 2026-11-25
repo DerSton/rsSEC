@@ -3489,6 +3489,8 @@ dependencies = [
  "hex",
  "ipnet",
  "keyring",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
