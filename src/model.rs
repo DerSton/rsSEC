@@ -1,5 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
+
+use desec::api::rrsets::MAX_TTL;
+use desec::{RecordType, Subname};
 
 pub const RECORD_TYPES: &[&str] = &[
     "A",
@@ -183,54 +187,7 @@ impl ZoneRow {
 
     /// Compares individual record values between cloud (`remote`) and working (`local`) state.
     pub fn record_diffs(&self) -> Vec<RecordValueDiff> {
-        match (&self.remote, &self.local) {
-            (None, Some(loc)) => loc
-                .records
-                .iter()
-                .map(|v| RecordValueDiff {
-                    kind: ValueDiffKind::Added,
-                    value: v.clone(),
-                })
-                .collect(),
-
-            (Some(rem), None) => rem
-                .records
-                .iter()
-                .map(|v| RecordValueDiff {
-                    kind: ValueDiffKind::Removed,
-                    value: v.clone(),
-                })
-                .collect(),
-
-            (Some(rem), Some(loc)) => {
-                let rem_set: BTreeSet<&str> = rem.records.iter().map(String::as_str).collect();
-                let loc_set: BTreeSet<&str> = loc.records.iter().map(String::as_str).collect();
-                let mut diffs = Vec::new();
-
-                for r in &rem.records {
-                    if !loc_set.contains(r.as_str()) {
-                        diffs.push(RecordValueDiff {
-                            kind: ValueDiffKind::Removed,
-                            value: r.clone(),
-                        });
-                    }
-                }
-                for l in &loc.records {
-                    let kind = if rem_set.contains(l.as_str()) {
-                        ValueDiffKind::Unchanged
-                    } else {
-                        ValueDiffKind::Added
-                    };
-                    diffs.push(RecordValueDiff {
-                        kind,
-                        value: l.clone(),
-                    });
-                }
-                diffs
-            }
-
-            (None, None) => Vec::new(),
-        }
+        diff_records(self.remote.as_ref(), self.local.as_ref())
     }
 
     pub fn matches_filter(&self, query_lower: &str, type_filter: &str, changes_only: bool) -> bool {
@@ -251,11 +208,68 @@ impl ZoneRow {
             .contains(query_lower);
         let type_match = self.key.rtype.to_ascii_lowercase().contains(query_lower);
         let val_match = self
-            .record_diffs()
+            .remote
             .iter()
-            .any(|d| d.value.to_ascii_lowercase().contains(query_lower));
+            .chain(self.local.iter())
+            .flat_map(|d| d.records.iter())
+            .any(|v| v.to_ascii_lowercase().contains(query_lower));
 
         sub_match || type_match || val_match
+    }
+}
+
+/// Computes an order-insensitive diff of individual record values between cloud and local state.
+pub fn diff_records(
+    remote: Option<&RrsetData>,
+    local: Option<&RrsetData>,
+) -> Vec<RecordValueDiff> {
+    match (remote, local) {
+        (None, Some(loc)) => loc
+            .records
+            .iter()
+            .map(|v| RecordValueDiff {
+                kind: ValueDiffKind::Added,
+                value: v.clone(),
+            })
+            .collect(),
+
+        (Some(rem), None) => rem
+            .records
+            .iter()
+            .map(|v| RecordValueDiff {
+                kind: ValueDiffKind::Removed,
+                value: v.clone(),
+            })
+            .collect(),
+
+        (Some(rem), Some(loc)) => {
+            let rem_set: BTreeSet<&str> = rem.records.iter().map(String::as_str).collect();
+            let loc_set: BTreeSet<&str> = loc.records.iter().map(String::as_str).collect();
+            let mut diffs = Vec::new();
+
+            for r in &rem.records {
+                if !loc_set.contains(r.as_str()) {
+                    diffs.push(RecordValueDiff {
+                        kind: ValueDiffKind::Removed,
+                        value: r.clone(),
+                    });
+                }
+            }
+            for l in &loc.records {
+                let kind = if rem_set.contains(l.as_str()) {
+                    ValueDiffKind::Unchanged
+                } else {
+                    ValueDiffKind::Added
+                };
+                diffs.push(RecordValueDiff {
+                    kind,
+                    value: l.clone(),
+                });
+            }
+            diffs
+        }
+
+        (None, None) => Vec::new(),
     }
 }
 
@@ -398,11 +412,16 @@ impl ZoneState {
 
     pub fn summary(&self) -> DiffSummary {
         let mut summary = DiffSummary::default();
-        for op in self.diff() {
-            match op {
-                DiffOp::Create { .. } => summary.added += 1,
-                DiffOp::Update { .. } => summary.modified += 1,
-                DiffOp::Delete { .. } => summary.deleted += 1,
+        for (key, rem) in &self.remote {
+            match self.local.get(key) {
+                Some(loc) if loc != rem => summary.modified += 1,
+                None => summary.deleted += 1,
+                _ => {}
+            }
+        }
+        for key in self.local.keys() {
+            if !self.remote.contains_key(key) {
+                summary.added += 1;
             }
         }
         summary
@@ -418,9 +437,9 @@ impl ZoneState {
         new_key: RrsetKey,
         data: RrsetData,
     ) -> Result<(), String> {
-        if new_key.rtype.is_empty() {
-            return Err("Record type cannot be empty.".to_owned());
-        }
+        Subname::new(&new_key.subname).map_err(|err| format!("{err}"))?;
+        RecordType::from_str(&new_key.rtype).map_err(|err| format!("{err}"))?;
+
         if data.records.is_empty() {
             return Err("At least one record value is required.".to_owned());
         }
@@ -429,6 +448,9 @@ impl ZoneState {
                 "TTL must be at least {} seconds (domain minimum).",
                 self.minimum_ttl
             ));
+        }
+        if data.ttl > MAX_TTL {
+            return Err(format!("TTL cannot exceed {MAX_TTL} seconds."));
         }
 
         let is_rename = original_key.is_some_and(|old| old != &new_key);
@@ -473,6 +495,9 @@ impl ZoneState {
                 self.minimum_ttl
             ));
         }
+        if ttl > MAX_TTL {
+            return Err(format!("TTL cannot exceed {MAX_TTL}s."));
+        }
 
         let mut updated = 0;
         for key in keys {
@@ -513,5 +538,96 @@ impl ZoneState {
             types.insert(key.rtype.clone());
         }
         types.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_matches_diff_and_diff_records_is_order_insensitive() {
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            RrsetKey::new("", "A"),
+            RrsetData::new(3600, vec!["192.0.2.1".to_owned(), "192.0.2.2".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("old", "A"),
+            RrsetData::new(3600, vec!["192.0.2.9".to_owned()]),
+        );
+        remote.insert(
+            RrsetKey::new("www", "CNAME"),
+            RrsetData::new(3600, vec!["example.com.".to_owned()]),
+        );
+
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, remote);
+        // Reordered A records -> still synced.
+        zone.upsert_local(
+            Some(&RrsetKey::new("", "A")),
+            RrsetKey::new("", "A"),
+            RrsetData::new(3600, vec!["192.0.2.2".to_owned(), "192.0.2.1".to_owned()]),
+        )
+        .unwrap();
+        assert!(!zone.is_dirty());
+
+        // Add one, modify one, delete one.
+        zone.upsert_local(
+            None,
+            RrsetKey::new("new", "AAAA"),
+            RrsetData::new(3600, vec!["2001:db8::1".to_owned()]),
+        )
+        .unwrap();
+        zone.upsert_local(
+            Some(&RrsetKey::new("www", "CNAME")),
+            RrsetKey::new("www", "CNAME"),
+            RrsetData::new(7200, vec!["cdn.example.com.".to_owned()]),
+        )
+        .unwrap();
+        zone.delete_local(&RrsetKey::new("old", "A"));
+
+        assert_eq!(
+            zone.summary(),
+            DiffSummary {
+                added: 1,
+                modified: 1,
+                deleted: 1,
+            }
+        );
+        assert_eq!(zone.diff().len(), 3);
+
+        let diffs = diff_records(
+            zone.remote.get(&RrsetKey::new("", "A")),
+            zone.local.get(&RrsetKey::new("", "A")),
+        );
+        assert!(diffs.iter().all(|d| d.kind == ValueDiffKind::Unchanged));
+    }
+
+    #[test]
+    fn upsert_and_bulk_ttl_reject_invalid_subname_and_excessive_ttl() {
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, BTreeMap::new());
+
+        assert!(
+            zone.upsert_local(
+                None,
+                RrsetKey::new("invalid.", "A"),
+                RrsetData::new(3600, vec!["192.0.2.1".to_owned()]),
+            )
+            .is_err()
+        );
+
+        assert!(
+            zone.upsert_local(
+                None,
+                RrsetKey::new("www", "A"),
+                RrsetData::new(86_401, vec!["192.0.2.1".to_owned()]),
+            )
+            .is_err()
+        );
+
+        assert!(
+            zone.set_ttl_bulk(&[RrsetKey::new("www", "A")], 86_401)
+                .is_err()
+        );
     }
 }

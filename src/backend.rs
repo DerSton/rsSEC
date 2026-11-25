@@ -1,25 +1,40 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 use desec::api::rrsets::{BulkPatch, Rrset};
 use desec::{Client, Error as DesecError, RecordType, Subname};
 use eframe::egui;
+use tokio::sync::RwLock;
 
 use crate::model::{DiffOp, DomainSummary, RrsetData, RrsetKey};
+use crate::token::scrub_secret;
+
+type ClientsMap = Arc<RwLock<HashMap<String, Client>>>;
 
 #[derive(Debug)]
 pub enum BackendCommand {
     Connect {
+        account_id: String,
         token: String,
     },
-    FetchDomains,
+    Disconnect {
+        account_id: String,
+    },
+    FetchDomains {
+        account_id: String,
+    },
     FetchZone {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
     },
     ApplyChanges {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         ops: Vec<DiffOp>,
@@ -29,23 +44,31 @@ pub enum BackendCommand {
 #[derive(Debug)]
 pub enum BackendEvent {
     Connected {
+        account_id: String,
+        email: Option<String>,
         domains: Vec<DomainSummary>,
     },
     DomainsLoaded {
+        account_id: String,
         domains: Vec<DomainSummary>,
     },
     ZoneLoaded {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         rrsets: BTreeMap<RrsetKey, RrsetData>,
     },
     ChangesApplied {
+        account_id: String,
         domain: String,
         minimum_ttl: u32,
         applied_count: usize,
-        rrsets: BTreeMap<RrsetKey, RrsetData>,
+        rrsets: Option<BTreeMap<RrsetKey, RrsetData>>,
+        warning: Option<String>,
     },
     Error {
+        account_id: String,
+        domain: Option<String>,
         context: String,
         message: String,
     },
@@ -91,33 +114,66 @@ async fn worker_loop(
     event_tx: Sender<BackendEvent>,
     ctx: egui::Context,
 ) {
-    let mut client: Option<Client> = None;
+    let clients: ClientsMap = Arc::new(RwLock::new(HashMap::new()));
 
     while let Ok(cmd) = cmd_rx.recv() {
-        let event = match cmd {
-            BackendCommand::Connect { token } => handle_connect(&mut client, &token).await,
-            BackendCommand::FetchDomains => handle_fetch_domains(client.as_ref()).await,
-            BackendCommand::FetchZone {
-                domain,
-                minimum_ttl,
-            } => handle_fetch_zone(client.as_ref(), domain, minimum_ttl).await,
-            BackendCommand::ApplyChanges {
-                domain,
-                minimum_ttl,
-                ops,
-            } => handle_apply_changes(client.as_ref(), domain, minimum_ttl, ops).await,
-        };
+        if let BackendCommand::Disconnect { account_id } = cmd {
+            clients.write().await.remove(&account_id);
+            continue;
+        }
 
-        let _ = event_tx.send(event);
-        ctx.request_repaint();
+        let clients = Arc::clone(&clients);
+        let event_tx = event_tx.clone();
+        let ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            let event = match cmd {
+                BackendCommand::Connect {
+                    account_id,
+                    mut token,
+                } => {
+                    let ev = handle_connect(&clients, account_id, &token).await;
+                    scrub_secret(&mut token);
+                    ev
+                }
+                BackendCommand::FetchDomains { account_id } => {
+                    handle_fetch_domains(&clients, account_id).await
+                }
+                BackendCommand::FetchZone {
+                    account_id,
+                    domain,
+                    minimum_ttl,
+                } => handle_fetch_zone(&clients, account_id, domain, minimum_ttl).await,
+                BackendCommand::ApplyChanges {
+                    account_id,
+                    domain,
+                    minimum_ttl,
+                    ops,
+                } => handle_apply_changes(&clients, account_id, domain, minimum_ttl, ops).await,
+                BackendCommand::Disconnect { .. } => unreachable!(),
+            };
+
+            let _ = event_tx.send(event);
+            ctx.request_repaint();
+        });
     }
 }
 
-async fn handle_connect(client_slot: &mut Option<Client>, token: &str) -> BackendEvent {
-    let new_client = match Client::new(token.trim()) {
+async fn get_client(clients: &ClientsMap, account_id: &str) -> Option<Client> {
+    clients.read().await.get(account_id).cloned()
+}
+
+async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -> BackendEvent {
+    let new_client = match Client::builder()
+        .token(token.trim())
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
         Ok(c) => c,
         Err(err) => {
             return BackendEvent::Error {
+                account_id,
+                domain: None,
                 context: "Connect".to_owned(),
                 message: err.to_string(),
             };
@@ -126,24 +182,38 @@ async fn handle_connect(client_slot: &mut Option<Client>, token: &str) -> Backen
 
     match fetch_domains(&new_client).await {
         Ok(domains) => {
-            *client_slot = Some(new_client);
-            BackendEvent::Connected { domains }
+            // `GET /auth/account/` requires `perm_manage_tokens`; scoped DNS tokens return 403,
+            // so treat account metadata lookup as best-effort and fall back cleanly.
+            let email = new_client.account().get().await.ok().map(|acc| acc.email);
+            clients.write().await.insert(account_id.clone(), new_client);
+            BackendEvent::Connected {
+                account_id,
+                email,
+                domains,
+            }
         }
         Err(err) => BackendEvent::Error {
+            account_id,
+            domain: None,
             context: "Connect".to_owned(),
             message: format_desec_error(&err, None),
         },
     }
 }
 
-async fn handle_fetch_domains(client: Option<&Client>) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error("Fetch domains");
+async fn handle_fetch_domains(clients: &ClientsMap, account_id: String) -> BackendEvent {
+    let Some(client) = get_client(clients, &account_id).await else {
+        return not_connected_error(account_id, None, "Fetch domains");
     };
 
-    match fetch_domains(client).await {
-        Ok(domains) => BackendEvent::DomainsLoaded { domains },
+    match fetch_domains(&client).await {
+        Ok(domains) => BackendEvent::DomainsLoaded {
+            account_id,
+            domains,
+        },
         Err(err) => BackendEvent::Error {
+            account_id,
+            domain: None,
             context: "Fetch domains".to_owned(),
             message: format_desec_error(&err, None),
         },
@@ -151,35 +221,42 @@ async fn handle_fetch_domains(client: Option<&Client>) -> BackendEvent {
 }
 
 async fn handle_fetch_zone(
-    client: Option<&Client>,
+    clients: &ClientsMap,
+    account_id: String,
     domain: String,
     minimum_ttl: u32,
 ) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error(&format!("Fetch {domain}"));
+    let Some(client) = get_client(clients, &account_id).await else {
+        let context = format!("Fetch {domain}");
+        return not_connected_error(account_id, Some(domain), &context);
     };
 
-    match fetch_rrsets(client, &domain).await {
+    match fetch_rrsets(&client, &domain).await {
         Ok(rrsets) => BackendEvent::ZoneLoaded {
+            account_id,
             domain,
             minimum_ttl,
             rrsets,
         },
         Err(err) => BackendEvent::Error {
+            account_id,
             context: format!("Fetch {domain}"),
+            domain: Some(domain),
             message: format_desec_error(&err, None),
         },
     }
 }
 
 async fn handle_apply_changes(
-    client: Option<&Client>,
+    clients: &ClientsMap,
+    account_id: String,
     domain: String,
     minimum_ttl: u32,
     ops: Vec<DiffOp>,
 ) -> BackendEvent {
-    let Some(client) = client else {
-        return not_connected_error(&format!("Apply {domain}"));
+    let Some(client) = get_client(clients, &account_id).await else {
+        let context = format!("Apply {domain}");
+        return not_connected_error(account_id, Some(domain), &context);
     };
 
     let mut patches = Vec::with_capacity(ops.len());
@@ -188,7 +265,9 @@ async fn handle_apply_changes(
             Ok(patch) => patches.push(patch),
             Err(message) => {
                 return BackendEvent::Error {
+                    account_id,
                     context: format!("Apply {domain}"),
+                    domain: Some(domain),
                     message,
                 };
             }
@@ -197,25 +276,33 @@ async fn handle_apply_changes(
 
     if let Err(err) = client.rrsets(&domain).patch_bulk(&patches).await {
         return BackendEvent::Error {
+            account_id,
             context: format!("Apply {domain}"),
+            domain: Some(domain),
             message: format_desec_error(&err, Some(&ops)),
         };
     }
 
     let applied_count = ops.len();
-    match fetch_rrsets(client, &domain).await {
+    match fetch_rrsets(&client, &domain).await {
         Ok(rrsets) => BackendEvent::ChangesApplied {
+            account_id,
             domain,
             minimum_ttl,
             applied_count,
-            rrsets,
+            rrsets: Some(rrsets),
+            warning: None,
         },
-        Err(err) => BackendEvent::Error {
-            context: format!("Refresh {domain}"),
-            message: format!(
+        Err(err) => BackendEvent::ChangesApplied {
+            account_id,
+            domain,
+            minimum_ttl,
+            applied_count,
+            rrsets: None,
+            warning: Some(format!(
                 "Changes were applied to deSEC, but refreshing failed: {}",
                 format_desec_error(&err, None)
-            ),
+            )),
         },
     }
 }
@@ -239,8 +326,14 @@ fn build_bulk_patch(op: &DiffOp) -> Result<BulkPatch, String> {
     Ok(patch)
 }
 
-fn not_connected_error(context: &str) -> BackendEvent {
+fn not_connected_error(
+    account_id: String,
+    domain: Option<String>,
+    context: &str,
+) -> BackendEvent {
     BackendEvent::Error {
+        account_id,
+        domain,
         context: context.to_owned(),
         message: "Not connected. Configure an API token first.".to_owned(),
     }
@@ -333,25 +426,45 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
         }
     }
 
+    if let Some(source) = err.source() {
+        return sanitize_error_text(&format!("{err}: {source}"));
+    }
+
     sanitize_error_text(&err.to_string())
 }
 
-// Strips raw HTML error pages (e.g. from nginx/proxies) down to a single summary line.
+// Strips raw HTML error pages, bidirectional override control characters, and caps length.
 fn sanitize_error_text(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    let trimmed = cleaned.trim();
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.contains("<html") || lower.contains("<head>") {
+    if lower.contains("<html") || lower.contains("<head") || lower.contains("<!doctype html") {
         if let Some(start) = lower.find("<title>")
             && let Some(end) = lower[start + 7..].find("</title>")
         {
             let title = trimmed[start + 7..start + 7 + end].trim();
             if !title.is_empty() {
-                return format!("Server error ({title}). Please try again.");
+                return truncate_error(&format!("Server error ({title}). Please try again."));
             }
         }
         return "Server returned an HTML error page. Please try again.".to_owned();
     }
 
-    trimmed.to_owned()
+    truncate_error(trimmed)
+}
+
+fn truncate_error(s: &str) -> String {
+    const MAX_LEN: usize = 500;
+    if s.len() <= MAX_LEN {
+        return s.to_owned();
+    }
+    let mut end = MAX_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
