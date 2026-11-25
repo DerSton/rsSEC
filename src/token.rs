@@ -65,14 +65,28 @@ fn token_entry_key(id: &str) -> String {
     format!("token:{id}")
 }
 
+/// Overwrites a string's buffer in-place before clearing it.
+pub fn scrub_secret(secret: &mut String) {
+    // SAFETY: Overwriting valid UTF-8 bytes with ASCII zero bytes (0x00) preserves valid UTF-8.
+    unsafe {
+        secret.as_bytes_mut().fill(0);
+    }
+    secret.clear();
+}
+
 /// Generates a unique local account identifier for keyring secret storage.
-pub fn generate_account_id() -> String {
+pub fn generate_account_id(existing_ids: &[&str]) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("acc-{millis:x}-{seq}")
+    loop {
+        let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("acc-{millis:x}-{seq}");
+        if !existing_ids.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
 }
 
 /// Builds a readable fallback label when `GET /auth/account/` is unavailable (e.g. scoped tokens).
@@ -94,24 +108,20 @@ pub fn load_env_token() -> Option<String> {
 
 /// Loads saved account metadata from the OS keyring, transparently migrating the legacy
 /// single-token entry (`api-token`) on first run.
-pub fn load_accounts() -> StoredAccounts {
-    if let Ok(entry) = Entry::new(SERVICE_NAME, ACCOUNTS_INDEX_KEY) {
-        match entry.get_password() {
-            Ok(raw) => {
-                if let Ok(store) = serde_json::from_str::<StoredAccounts>(&raw) {
-                    return store;
-                }
+pub fn load_accounts() -> Result<StoredAccounts, String> {
+    let entry = Entry::new(SERVICE_NAME, ACCOUNTS_INDEX_KEY)
+        .map_err(|e| format!("Keyring unavailable: {e}"))?;
+    match entry.get_password() {
+        Ok(raw) => serde_json::from_str::<StoredAccounts>(&raw)
+            .map_err(|e| format!("Failed to parse keyring accounts metadata: {e}")),
+        Err(keyring::Error::NoEntry) => {
+            if let Some(migrated) = migrate_legacy_token() {
+                return Ok(migrated);
             }
-            Err(keyring::Error::NoEntry) => {
-                if let Some(migrated) = migrate_legacy_token() {
-                    return migrated;
-                }
-            }
-            Err(_) => {}
+            Ok(StoredAccounts::default())
         }
+        Err(e) => Err(format!("Failed to read accounts from keyring: {e}")),
     }
-
-    StoredAccounts::default()
 }
 
 fn migrate_legacy_token() -> Option<StoredAccounts> {
@@ -260,5 +270,16 @@ mod tests {
             ),
             "a.example (+2)"
         );
+    }
+
+    #[test]
+    fn scrub_secret_zeroes_and_clears_buffer() {
+        let mut secret = "super-secret-token".to_owned();
+        let ptr = secret.as_ptr();
+        let cap = secret.capacity();
+        scrub_secret(&mut secret);
+        assert!(secret.is_empty());
+        let raw = unsafe { std::slice::from_raw_parts(ptr, cap.min(18)) };
+        assert!(raw.iter().all(|&b| b == 0));
     }
 }

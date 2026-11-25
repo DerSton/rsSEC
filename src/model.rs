@@ -1,5 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
+
+use desec::api::rrsets::MAX_TTL;
+use desec::{RecordType, Subname};
 
 pub const RECORD_TYPES: &[&str] = &[
     "A",
@@ -433,9 +437,9 @@ impl ZoneState {
         new_key: RrsetKey,
         data: RrsetData,
     ) -> Result<(), String> {
-        if new_key.rtype.is_empty() {
-            return Err("Record type cannot be empty.".to_owned());
-        }
+        Subname::new(&new_key.subname).map_err(|err| format!("{err}"))?;
+        RecordType::from_str(&new_key.rtype).map_err(|err| format!("{err}"))?;
+
         if data.records.is_empty() {
             return Err("At least one record value is required.".to_owned());
         }
@@ -444,6 +448,9 @@ impl ZoneState {
                 "TTL must be at least {} seconds (domain minimum).",
                 self.minimum_ttl
             ));
+        }
+        if data.ttl > MAX_TTL {
+            return Err(format!("TTL cannot exceed {MAX_TTL} seconds."));
         }
 
         let is_rename = original_key.is_some_and(|old| old != &new_key);
@@ -487,6 +494,9 @@ impl ZoneState {
                 "TTL must be at least {}s (domain minimum).",
                 self.minimum_ttl
             ));
+        }
+        if ttl > MAX_TTL {
+            return Err(format!("TTL cannot exceed {MAX_TTL}s."));
         }
 
         let mut updated = 0;
@@ -591,5 +601,33 @@ mod tests {
             zone.local.get(&RrsetKey::new("", "A")),
         );
         assert!(diffs.iter().all(|d| d.kind == ValueDiffKind::Unchanged));
+    }
+
+    #[test]
+    fn upsert_and_bulk_ttl_reject_invalid_subname_and_excessive_ttl() {
+        let mut zone = ZoneState::from_remote("example.com".to_owned(), 3600, BTreeMap::new());
+
+        assert!(
+            zone.upsert_local(
+                None,
+                RrsetKey::new("invalid.", "A"),
+                RrsetData::new(3600, vec!["192.0.2.1".to_owned()]),
+            )
+            .is_err()
+        );
+
+        assert!(
+            zone.upsert_local(
+                None,
+                RrsetKey::new("www", "A"),
+                RrsetData::new(86_401, vec!["192.0.2.1".to_owned()]),
+            )
+            .is_err()
+        );
+
+        assert!(
+            zone.set_ttl_bulk(&[RrsetKey::new("www", "A")], 86_401)
+                .is_err()
+        );
     }
 }

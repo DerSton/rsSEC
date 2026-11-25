@@ -1,6 +1,6 @@
 use eframe::egui::{self, RichText};
 
-use crate::token::AccountSource;
+use crate::token::{AccountSource, scrub_secret};
 use crate::ui::theme::{color_deleted, color_modified};
 
 #[derive(Debug, Clone)]
@@ -38,6 +38,12 @@ impl AccountsModal {
     }
 }
 
+impl Drop for AccountsModal {
+    fn drop(&mut self) {
+        scrub_secret(&mut self.token_input);
+    }
+}
+
 pub enum AccountsModalAction {
     None,
     AddAccount {
@@ -59,8 +65,10 @@ pub fn render_accounts_modal(
     ctx: &egui::Context,
     modal: &mut AccountsModal,
     accounts: &[AccountListItem],
+    blocked: bool,
 ) -> AccountsModalAction {
-    let can_close = !accounts.is_empty() && !modal.connecting;
+    let busy = modal.connecting || blocked;
+    let can_close = !accounts.is_empty() && !busy;
     if can_close && modal.editing.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         return AccountsModalAction::Close;
     }
@@ -80,7 +88,7 @@ pub fn render_accounts_modal(
         .show(ctx, |ui| {
             ui.set_min_width(420.0);
 
-            ui.add_enabled_ui(!modal.connecting, |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
                 let token_resp = ui.add(
                     egui::TextEdit::singleline(&mut modal.token_input)
                         .password(true)
@@ -149,10 +157,12 @@ pub fn render_accounts_modal(
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
-                        for item in accounts {
-                            render_account_row(ui, modal, item, &mut action);
-                            ui.add_space(2.0);
-                        }
+                        ui.add_enabled_ui(!blocked, |ui| {
+                            for item in accounts {
+                                render_account_row(ui, modal, item, &mut action);
+                                ui.add_space(2.0);
+                            }
+                        });
                     });
             }
         });

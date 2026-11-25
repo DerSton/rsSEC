@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{DomainSummary, RrsetData, RrsetKey, ZoneState};
-use crate::token::{AccountSource, StoredAccount};
+use crate::token::{AccountSource, StoredAccount, scrub_secret};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -86,6 +86,26 @@ impl DomainState {
         self.error = None;
         self.status_message = status_message;
     }
+
+    /// Marks the current local state as committed to remote when a bulk write succeeded
+    /// but the follow-up zone refresh failed.
+    pub fn mark_local_as_synced(
+        &mut self,
+        minimum_ttl: u32,
+        status_message: String,
+        warning: Option<String>,
+    ) {
+        self.minimum_ttl = minimum_ttl;
+        if let Some(zone) = &mut self.zone {
+            zone.minimum_ttl = minimum_ttl;
+            zone.remote = zone.local.clone();
+        }
+        self.selected_keys.clear();
+        self.loading = false;
+        self.busy_label = None;
+        self.error = warning;
+        self.status_message = status_message;
+    }
 }
 
 /// Ephemeral in-RAM session state for one deSEC account/token tab.
@@ -106,6 +126,14 @@ pub struct AccountState {
 
     pub domains: BTreeMap<String, DomainState>,
     pub active_domain: Option<String>,
+}
+
+impl Drop for AccountState {
+    fn drop(&mut self) {
+        if let Some(token) = &mut self.ephemeral_token {
+            scrub_secret(token);
+        }
+    }
 }
 
 impl AccountState {

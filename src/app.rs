@@ -21,6 +21,12 @@ struct PendingAddAccount {
     save_to_keyring: bool,
 }
 
+impl Drop for PendingAddAccount {
+    fn drop(&mut self) {
+        token::scrub_secret(&mut self.token);
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ConfirmDiscard {
     RefreshDomain { account_id: String, domain: String },
@@ -33,6 +39,7 @@ pub struct DesecApp {
     accounts: Vec<AccountState>,
     active_account_id: Option<String>,
     pending_add: Option<PendingAddAccount>,
+    keyring_unloaded: bool,
 
     accounts_modal: Option<AccountsModal>,
     editor_modal: Option<RecordEditorModal>,
@@ -50,7 +57,10 @@ impl DesecApp {
         });
 
         let backend = BackendHandle::spawn(cc.egui_ctx.clone());
-        let stored = token::load_accounts();
+        let (stored, keyring_err, keyring_unloaded) = match token::load_accounts() {
+            Ok(store) => (store, None, false),
+            Err(err) => (StoredAccounts::default(), Some(err), true),
+        };
         let initial_active = stored.resolved_active_id().map(str::to_owned);
 
         let mut accounts: Vec<AccountState> = stored
@@ -60,26 +70,36 @@ impl DesecApp {
             .collect();
 
         if let Some(env_token) = token::load_env_token() {
-            let already_saved = accounts.iter().any(|acc| {
-                token::load_account_secret(&acc.id)
+            // Only compare against the active account's secret (if any) to avoid triggering
+            // OS keyring prompts for every inactive account on startup.
+            let matches_active = initial_active.as_deref().is_some_and(|id| {
+                token::load_account_secret(id)
                     .ok()
                     .flatten()
                     .as_deref()
                     == Some(env_token.as_str())
             });
-            if !already_saved {
+            if !matches_active {
                 accounts.push(AccountState::from_env(env_token));
             }
         }
 
         let active_account_id = initial_active.or_else(|| accounts.first().map(|a| a.id.clone()));
-        let accounts_modal = accounts.is_empty().then(AccountsModal::new);
+        let mut accounts_modal = accounts.is_empty().then(AccountsModal::new);
+        if let Some(err) = keyring_err {
+            if let Some(modal) = &mut accounts_modal {
+                modal.error = Some(err);
+            } else if let Some(first) = accounts.first_mut() {
+                first.error = Some(err);
+            }
+        }
 
         let mut app = Self {
             backend,
             accounts,
             active_account_id: active_account_id.clone(),
             pending_add: None,
+            keyring_unloaded,
             accounts_modal,
             editor_modal: None,
             show_review_modal: false,
@@ -132,7 +152,17 @@ impl DesecApp {
         (changes, domains)
     }
 
-    fn persist_keyring_index(&self) -> Result<(), String> {
+    fn persist_keyring_index(&mut self) -> Result<(), String> {
+        if self.keyring_unloaded {
+            let existing = token::load_accounts()?;
+            for stored in existing.accounts {
+                if !self.accounts.iter().any(|a| a.id == stored.id) {
+                    self.accounts.push(AccountState::from_stored(stored));
+                }
+            }
+            self.keyring_unloaded = false;
+        }
+
         let accounts: Vec<StoredAccount> = self
             .accounts
             .iter()
@@ -235,11 +265,12 @@ impl DesecApp {
 
     fn start_add_account(
         &mut self,
-        token_val: String,
+        mut token_val: String,
         custom_label: Option<String>,
         save_to_keyring: bool,
     ) {
         if let Some(existing_id) = self.find_existing_account_for_token(&token_val) {
+            token::scrub_secret(&mut token_val);
             self.accounts_modal = None;
             self.activate_account(&existing_id);
             if let Some(acc) = self.account_mut(&existing_id) {
@@ -248,7 +279,8 @@ impl DesecApp {
             return;
         }
 
-        let account_id = token::generate_account_id();
+        let existing_ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
+        let account_id = token::generate_account_id(&existing_ids);
         self.pending_add = Some(PendingAddAccount {
             id: account_id.clone(),
             token: token_val.clone(),
@@ -476,17 +508,29 @@ impl DesecApp {
                     minimum_ttl,
                     applied_count,
                     rrsets,
+                    warning,
                 } => {
-                    let count = rrsets.len();
                     let is_active_view = self.is_active_domain(&account_id, &domain);
                     if let Some(acc) = self.account_mut(&account_id)
                         && let Some(dom) = acc.domains.get_mut(&domain)
                     {
-                        dom.apply_loaded_zone(
-                            minimum_ttl,
-                            rrsets,
-                            format!("Applied {applied_count} to {domain} ({count} RRsets)"),
-                        );
+                        match rrsets {
+                            Some(rrsets) => {
+                                let count = rrsets.len();
+                                dom.apply_loaded_zone(
+                                    minimum_ttl,
+                                    rrsets,
+                                    format!("Applied {applied_count} to {domain} ({count} RRsets)"),
+                                );
+                            }
+                            None => {
+                                dom.mark_local_as_synced(
+                                    minimum_ttl,
+                                    format!("Applied {applied_count} to {domain}"),
+                                    warning,
+                                );
+                            }
+                        }
                     }
                     if is_active_view {
                         self.show_review_modal = false;
@@ -512,6 +556,10 @@ impl DesecApp {
                         continue;
                     }
 
+                    let is_active_domain_err = domain
+                        .as_deref()
+                        .is_some_and(|d| self.is_active_domain(&account_id, d));
+
                     if let Some(acc) = self.account_mut(&account_id) {
                         if let Some(domain_name) = domain
                             && let Some(dom) = acc.domains.get_mut(&domain_name)
@@ -528,6 +576,10 @@ impl DesecApp {
                             acc.error = Some(format!("{context}: {message}"));
                             acc.status_message = format!("{context} failed");
                         }
+                    }
+
+                    if is_active_domain_err {
+                        self.show_review_modal = false;
                     }
                 }
             }
@@ -554,8 +606,10 @@ impl DesecApp {
             .is_some_and(|p| p.id == account_id)
         {
             let pending = self.pending_add.take().expect("checked above");
+            let pending_id = pending.id.clone();
+            let pending_token = pending.token.clone();
             let fallback_idx = self.accounts.len() + 1;
-            let (label, custom_label) = match pending.custom_label {
+            let (label, custom_label) = match pending.custom_label.clone() {
                 Some(custom) => (custom, true),
                 None => (
                     email
@@ -567,15 +621,15 @@ impl DesecApp {
 
             let mut keyring_warning = None;
             let (source, ephemeral_token) = if pending.save_to_keyring {
-                match token::save_account_secret(&pending.id, &pending.token) {
+                match token::save_account_secret(&pending_id, &pending_token) {
                     Ok(()) => (AccountSource::Keyring, None),
                     Err(err) => {
                         keyring_warning = Some(err);
-                        (AccountSource::Session, Some(pending.token))
+                        (AccountSource::Session, Some(pending_token.clone()))
                     }
                 }
             } else {
-                (AccountSource::Session, Some(pending.token))
+                (AccountSource::Session, Some(pending_token.clone()))
             };
 
             let status_message = if domains.is_empty() {
@@ -585,7 +639,7 @@ impl DesecApp {
             };
 
             let mut acc = AccountState {
-                id: pending.id.clone(),
+                id: pending_id.clone(),
                 label,
                 email,
                 custom_label,
@@ -602,18 +656,26 @@ impl DesecApp {
             let first_domain = acc.active_domain.clone();
 
             self.accounts.push(acc);
-            self.active_account_id = Some(pending.id.clone());
+            self.active_account_id = Some(pending_id.clone());
             self.accounts_modal = None;
 
             if source == AccountSource::Keyring
                 && let Err(err) = self.persist_keyring_index()
-                && let Some(acc) = self.account_mut(&pending.id)
             {
-                acc.error = Some(err);
+                // Roll back the secret entry so it does not remain orphaned in the OS keyring.
+                let _ = token::delete_account_secret(&pending_id);
+                if let Some(acc) = self.account_mut(&pending_id) {
+                    acc.source = AccountSource::Session;
+                    acc.ephemeral_token = Some(pending_token);
+                    acc.error = Some(err);
+                }
+            } else {
+                let mut scrubbed = pending_token;
+                token::scrub_secret(&mut scrubbed);
             }
 
             if let Some(domain) = first_domain {
-                self.request_fetch_zone(&pending.id, &domain);
+                self.request_fetch_zone(&pending_id, &domain);
             }
             return;
         }
@@ -1076,9 +1138,7 @@ impl DesecApp {
     }
 
     fn render_modals(&mut self, ctx: &egui::Context) {
-        if self.confirm_discard.is_none()
-            && let Some(mut modal) = self.accounts_modal.take()
-        {
+        if let Some(mut modal) = self.accounts_modal.take() {
             let items: Vec<AccountListItem> = self
                 .accounts
                 .iter()
@@ -1094,7 +1154,12 @@ impl DesecApp {
                 })
                 .collect();
 
-            match render_accounts_modal(ctx, &mut modal, &items) {
+            match render_accounts_modal(
+                ctx,
+                &mut modal,
+                &items,
+                self.confirm_discard.is_some(),
+            ) {
                 AccountsModalAction::None => {
                     self.accounts_modal = Some(modal);
                 }

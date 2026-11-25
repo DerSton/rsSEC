@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 use desec::api::rrsets::{BulkPatch, Rrset};
 use desec::{Client, Error as DesecError, RecordType, Subname};
@@ -10,6 +12,7 @@ use eframe::egui;
 use tokio::sync::RwLock;
 
 use crate::model::{DiffOp, DomainSummary, RrsetData, RrsetKey};
+use crate::token::scrub_secret;
 
 type ClientsMap = Arc<RwLock<HashMap<String, Client>>>;
 
@@ -60,7 +63,8 @@ pub enum BackendEvent {
         domain: String,
         minimum_ttl: u32,
         applied_count: usize,
-        rrsets: BTreeMap<RrsetKey, RrsetData>,
+        rrsets: Option<BTreeMap<RrsetKey, RrsetData>>,
+        warning: Option<String>,
     },
     Error {
         account_id: String,
@@ -124,8 +128,13 @@ async fn worker_loop(
 
         tokio::spawn(async move {
             let event = match cmd {
-                BackendCommand::Connect { account_id, token } => {
-                    handle_connect(&clients, account_id, &token).await
+                BackendCommand::Connect {
+                    account_id,
+                    mut token,
+                } => {
+                    let ev = handle_connect(&clients, account_id, &token).await;
+                    scrub_secret(&mut token);
+                    ev
                 }
                 BackendCommand::FetchDomains { account_id } => {
                     handle_fetch_domains(&clients, account_id).await
@@ -155,7 +164,11 @@ async fn get_client(clients: &ClientsMap, account_id: &str) -> Option<Client> {
 }
 
 async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -> BackendEvent {
-    let new_client = match Client::new(token.trim()) {
+    let new_client = match Client::builder()
+        .token(token.trim())
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
         Ok(c) => c,
         Err(err) => {
             return BackendEvent::Error {
@@ -277,16 +290,19 @@ async fn handle_apply_changes(
             domain,
             minimum_ttl,
             applied_count,
-            rrsets,
+            rrsets: Some(rrsets),
+            warning: None,
         },
-        Err(err) => BackendEvent::Error {
+        Err(err) => BackendEvent::ChangesApplied {
             account_id,
-            context: format!("Refresh {domain}"),
-            domain: Some(domain),
-            message: format!(
+            domain,
+            minimum_ttl,
+            applied_count,
+            rrsets: None,
+            warning: Some(format!(
                 "Changes were applied to deSEC, but refreshing failed: {}",
                 format_desec_error(&err, None)
-            ),
+            )),
         },
     }
 }
@@ -410,25 +426,45 @@ fn format_desec_error(err: &DesecError, ops: Option<&[DiffOp]>) -> String {
         }
     }
 
+    if let Some(source) = err.source() {
+        return sanitize_error_text(&format!("{err}: {source}"));
+    }
+
     sanitize_error_text(&err.to_string())
 }
 
-// Strips raw HTML error pages (e.g. from nginx/proxies) down to a single summary line.
+// Strips raw HTML error pages, bidirectional override control characters, and caps length.
 fn sanitize_error_text(raw: &str) -> String {
-    let trimmed = raw.trim();
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    let trimmed = cleaned.trim();
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.contains("<html") || lower.contains("<head>") {
+    if lower.contains("<html") || lower.contains("<head") || lower.contains("<!doctype html") {
         if let Some(start) = lower.find("<title>")
             && let Some(end) = lower[start + 7..].find("</title>")
         {
             let title = trimmed[start + 7..start + 7 + end].trim();
             if !title.is_empty() {
-                return format!("Server error ({title}). Please try again.");
+                return truncate_error(&format!("Server error ({title}). Please try again."));
             }
         }
         return "Server returned an HTML error page. Please try again.".to_owned();
     }
 
-    trimmed.to_owned()
+    truncate_error(trimmed)
+}
+
+fn truncate_error(s: &str) -> String {
+    const MAX_LEN: usize = 500;
+    if s.len() <= MAX_LEN {
+        return s.to_owned();
+    }
+    let mut end = MAX_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }

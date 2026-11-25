@@ -90,11 +90,12 @@ impl RecordEditorModal {
             return;
         }
 
-        let expected_len = schema_for_type(&current).len();
-        let is_unchanged_default = self.rows.len() == 1
-            && self.rows[0] == default_fields_for_type(&self.last_effective_type);
+        let prev_default = default_fields_for_type(&self.last_effective_type);
+        let is_unchanged_default = self.rows.iter().all(|row| row == &prev_default);
+        let schema_changed =
+            schema_for_type(&current) != schema_for_type(&self.last_effective_type);
 
-        if self.rows.is_empty() || self.rows[0].len() != expected_len || is_unchanged_default {
+        if self.rows.is_empty() || schema_changed || is_unchanged_default {
             self.rows = vec![default_fields_for_type(&current)];
         }
         self.last_effective_type = current;
@@ -133,10 +134,17 @@ pub fn render_editor_modal(
     modal.sync_schema_if_type_changed();
 
     let target_key = modal.current_key();
-    let cloud_entry = zone
-        .remote
-        .get(&target_key)
-        .or_else(|| modal.original_key.as_ref().and_then(|k| zone.remote.get(k)));
+    let cloud_entry = match &modal.original_key {
+        Some(orig) => zone
+            .remote
+            .get(&target_key)
+            .filter(|_| &target_key == orig || !zone.local.contains_key(&target_key))
+            .or_else(|| zone.remote.get(orig)),
+        None => zone
+            .remote
+            .get(&target_key)
+            .filter(|_| !zone.local.contains_key(&target_key)),
+    };
     let cloud_ttl_str = cloud_entry.map(|c| c.ttl.to_string());
 
     egui::Window::new(title)

@@ -33,7 +33,7 @@ pub enum FieldKind {
     Raw,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FieldSpec {
     pub label: &'static str,
     pub hint: &'static str,
@@ -98,7 +98,7 @@ pub fn schema_for_type(rtype: &str) -> &'static [FieldSpec] {
     const CAA: &[FieldSpec] = &[
         FieldSpec::req("Flags", "0", 52.0, FieldKind::U8),
         FieldSpec::req("Tag", "issue", 90.0, FieldKind::CaaTag),
-        FieldSpec::req("Value", "letsencrypt.org", 230.0, FieldKind::QuotedText),
+        FieldSpec::opt("Value", "letsencrypt.org", 230.0, FieldKind::QuotedText),
     ];
     const SVCB: &[FieldSpec] = &[
         FieldSpec::req("Prio", "1", 52.0, FieldKind::U16),
@@ -153,9 +153,9 @@ pub fn schema_for_type(rtype: &str) -> &'static [FieldSpec] {
     const NAPTR: &[FieldSpec] = &[
         FieldSpec::req("Order", "100", 50.0, FieldKind::U16),
         FieldSpec::req("Pref", "10", 50.0, FieldKind::U16),
-        FieldSpec::req("Flags", "S", 50.0, FieldKind::QuotedText),
-        FieldSpec::req("Service", "SIP+D2U", 85.0, FieldKind::QuotedText),
-        FieldSpec::req(
+        FieldSpec::opt("Flags", "S", 50.0, FieldKind::QuotedText),
+        FieldSpec::opt("Service", "SIP+D2U", 85.0, FieldKind::QuotedText),
+        FieldSpec::opt(
             "Regexp",
             "!^.*$!sip:info@example.com!",
             125.0,
@@ -295,6 +295,7 @@ pub fn parse_record_to_fields(rtype: &str, raw: &str) -> Vec<String> {
 
     if schema.len() == 1 {
         let val = match schema[0].kind {
+            FieldKind::QuotedText if trimmed == "\"\"" => trimmed.to_owned(),
             FieldKind::QuotedText => unquote_txt(trimmed),
             _ => trimmed.to_owned(),
         };
@@ -346,6 +347,9 @@ pub fn validate_and_format(rtype: &str, fields: &[String]) -> Result<String, Str
         let val = raw_val.trim();
         if val.is_empty() {
             if spec.optional {
+                if spec.kind == FieldKind::QuotedText {
+                    parts.push("\"\"".to_owned());
+                }
                 continue;
             }
             return Err(format!("{} is required.", spec.label));
@@ -490,7 +494,7 @@ fn validate_field(spec: &FieldSpec, val: &str) -> Result<String, String> {
             let s: f64 = val
                 .parse()
                 .map_err(|_| format!("{label}: must be 0..59.999."))?;
-            if !(0.0..60.0).contains(&s) {
+            if !s.is_finite() || !(0.0..60.0).contains(&s) {
                 return Err(format!("{label}: seconds must be 0..59.999."));
             }
             Ok(val.to_owned())
@@ -514,24 +518,35 @@ fn validate_field(spec: &FieldSpec, val: &str) -> Result<String, String> {
             let alt: f64 = num_part
                 .parse()
                 .map_err(|_| format!("{label}: invalid altitude in meters (e.g. 34.0m)."))?;
-            if !(-100_000.0..=42_849_672.95).contains(&alt) {
+            if !alt.is_finite() || !(-100_000.0..=42_849_672.95).contains(&alt) {
                 return Err(format!("{label}: altitude out of RFC 1876 range."));
             }
             Ok(format!("{num_part}m"))
         }
         FieldKind::LocSize => {
-            for tok in val.split_whitespace() {
+            let tokens: Vec<&str> = val.split_whitespace().collect();
+            if tokens.len() > 3 {
+                return Err(format!(
+                    "{label}: expected at most 3 measurements (size [horiz_pre [vert_pre]])."
+                ));
+            }
+            let mut formatted = Vec::with_capacity(tokens.len());
+            for tok in tokens {
                 let num = tok.strip_suffix('m').unwrap_or(tok);
                 let v: f64 = num
                     .parse()
                     .map_err(|_| format!("{label}: invalid meter measurement '{tok}'."))?;
-                if v < 0.0 {
-                    return Err(format!("{label}: measurement cannot be negative."));
+                if !v.is_finite() || !(0.0..=90_000_000.0).contains(&v) {
+                    return Err(format!("{label}: measurement '{tok}' out of range."));
                 }
+                formatted.push(format!("{num}m"));
             }
-            Ok(val.split_whitespace().collect::<Vec<_>>().join(" "))
+            Ok(formatted.join(" "))
         }
         FieldKind::SvcbParams => {
+            if has_unclosed_quotes(val) {
+                return Err(format!("{label}: unclosed quote in parameters."));
+            }
             for tok in tokenize_rdata(val) {
                 if let Some((k, _)) = tok.split_once('=') {
                     if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -613,8 +628,7 @@ fn validate_eui(label: &str, val: &str, expected_octets: usize) -> Result<String
 /// Formats a text value as a quoted BIND character-string (or leaves valid multi-segment quotes intact).
 fn quote_txt(input: &str) -> String {
     let trimmed = input.trim();
-    // If the user already entered properly quoted string(s), keep them.
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+    if is_valid_quoted_segments(trimmed) {
         return trimmed.to_owned();
     }
     let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
@@ -626,22 +640,88 @@ fn unquote_txt(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        // Only strip outer quotes if there are no unescaped middle quotes (multi-segment TXT).
-        let mut chars = inner.chars().peekable();
+        let mut chars = inner.chars();
+        let mut unescaped = String::with_capacity(inner.len());
         let mut has_unescaped_quote = false;
+
         while let Some(c) = chars.next() {
             if c == '\\' {
-                let _ = chars.next();
+                match chars.next() {
+                    Some(next @ ('"' | '\\')) => unescaped.push(next),
+                    Some(other) => {
+                        unescaped.push('\\');
+                        unescaped.push(other);
+                    }
+                    None => {
+                        // Trailing backslash before closing quote means the closing quote was escaped.
+                        has_unescaped_quote = true;
+                        break;
+                    }
+                }
             } else if c == '"' {
                 has_unescaped_quote = true;
                 break;
+            } else {
+                unescaped.push(c);
             }
         }
+
         if !has_unescaped_quote {
-            return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+            // Keep outer quotes if the unescaped content itself looks like pre-quoted BIND segments,
+            // so editing and saving a record containing literal outer quotes stays lossless.
+            if is_valid_quoted_segments(unescaped.trim()) {
+                return trimmed.to_owned();
+            }
+            return unescaped;
         }
     }
     trimmed.to_owned()
+}
+
+/// Returns `true` if `s` consists of one or more valid BIND quoted strings (`"..."`)
+/// separated only by ASCII whitespace.
+fn is_valid_quoted_segments(s: &str) -> bool {
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        return false;
+    }
+
+    let mut chars = s.chars();
+    let mut in_quotes = false;
+    let mut saw_segment = false;
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '\\' {
+                if chars.next().is_none() {
+                    return false;
+                }
+            } else if c == '"' {
+                in_quotes = false;
+                saw_segment = true;
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if !c.is_ascii_whitespace() {
+            return false;
+        }
+    }
+
+    saw_segment && !in_quotes
+}
+
+fn has_unclosed_quotes(s: &str) -> bool {
+    let mut chars = s.chars();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' && in_quotes {
+            if chars.next().is_none() {
+                return true;
+            }
+        } else if c == '"' {
+            in_quotes = !in_quotes;
+        }
+    }
+    in_quotes
 }
 
 /// Splits a BIND RDATA line into whitespace-delimited tokens while keeping quoted segments together.
@@ -674,4 +754,66 @@ fn tokenize_rdata(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txt_roundtrips_escaped_quotes_and_backslashes_losslessly() {
+        // Literal `"hello"` stored in BIND as `"\"hello\""` must not lose its inner quotes.
+        let fields = parse_record_to_fields("TXT", r#""\"hello\"""#);
+        let formatted = validate_and_format("TXT", &fields).unwrap();
+        assert_eq!(formatted, r#""\"hello\"""#);
+
+        // Two literal backslashes before a quote (`\\"`, stored in BIND as `"\\\\\""`).
+        let fields = parse_record_to_fields("TXT", r#""\\\\\"""#);
+        assert_eq!(fields, vec![r#"\\""#]);
+        let formatted = validate_and_format("TXT", &fields).unwrap();
+        assert_eq!(formatted, r#""\\\\\"""#);
+
+        // Unquoted text starting and ending with quotes but containing unquoted middle text
+        // must be escaped rather than treated as pre-quoted segments.
+        let formatted = validate_and_format("TXT", &[r#""foo" bar "baz""#.to_owned()]).unwrap();
+        assert_eq!(formatted, r#""\"foo\" bar \"baz\"""#);
+
+        // Empty TXT `""` roundtrips cleanly.
+        let fields = parse_record_to_fields("TXT", r#""""#);
+        assert_eq!(validate_and_format("TXT", &fields).unwrap(), r#""""#);
+    }
+
+    #[test]
+    fn naptr_and_caa_support_empty_quoted_fields() {
+        let raw_naptr = r#"100 10 "S" "SIP+D2U" "" _sip._udp.example.com."#;
+        let fields = parse_record_to_fields("NAPTR", raw_naptr);
+        assert_eq!(
+            fields,
+            vec!["100", "10", "S", "SIP+D2U", "", "_sip._udp.example.com."]
+        );
+        let formatted = validate_and_format("NAPTR", &fields).unwrap();
+        assert_eq!(formatted, raw_naptr);
+
+        let raw_caa = r#"0 issue """#;
+        let caa_fields = parse_record_to_fields("CAA", raw_caa);
+        assert_eq!(caa_fields, vec!["0", "issue", ""]);
+        assert_eq!(validate_and_format("CAA", &caa_fields).unwrap(), raw_caa);
+    }
+
+    #[test]
+    fn rejects_nan_infinity_and_unclosed_svcb_quotes() {
+        let mut loc = default_fields_for_type("LOC");
+        loc[9] = "NaN".to_owned();
+        assert!(validate_and_format("LOC", &loc).is_err());
+
+        loc[9] = "inf".to_owned();
+        assert!(validate_and_format("LOC", &loc).is_err());
+
+        let svcb = vec![
+            "1".to_owned(),
+            ".".to_owned(),
+            r#"alpn="h2,h3"#.to_owned(),
+        ];
+        assert!(validate_and_format("HTTPS", &svcb).is_err());
+    }
 }
