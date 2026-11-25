@@ -1,8 +1,6 @@
-use std::collections::BTreeSet;
-
 use eframe::egui::{self, RichText};
 
-use crate::model::{DiffOp, ZoneState};
+use crate::model::{DiffOp, ValueDiffKind, ZoneState, diff_records};
 use crate::ui::theme::{color_added, color_deleted, color_modified};
 
 pub enum ReviewModalAction {
@@ -78,30 +76,26 @@ pub fn render_review_modal(ctx: &egui::Context, zone: &ZoneState, busy: bool) ->
                                         ui.label(format!("TTL {}", new.ttl));
                                     }
 
-                                    let old_set: BTreeSet<&str> =
-                                        old.records.iter().map(String::as_str).collect();
-                                    let new_set: BTreeSet<&str> =
-                                        new.records.iter().map(String::as_str).collect();
-
-                                    for r in &old.records {
-                                        if !new_set.contains(r.as_str()) {
-                                            ui.label(
-                                                RichText::new(format!("- {r}"))
-                                                    .monospace()
-                                                    .color(color_deleted(ui))
-                                                    .strikethrough(),
-                                            );
-                                        }
-                                    }
-                                    for r in &new.records {
-                                        if old_set.contains(r.as_str()) {
-                                            ui.monospace(format!("  {r}"));
-                                        } else {
-                                            ui.label(
-                                                RichText::new(format!("+ {r}"))
-                                                    .monospace()
-                                                    .color(color_added(ui)),
-                                            );
+                                    for item in diff_records(Some(old), Some(new)) {
+                                        match item.kind {
+                                            ValueDiffKind::Removed => {
+                                                ui.label(
+                                                    RichText::new(format!("- {}", item.value))
+                                                        .monospace()
+                                                        .color(color_deleted(ui))
+                                                        .strikethrough(),
+                                                );
+                                            }
+                                            ValueDiffKind::Unchanged => {
+                                                ui.monospace(format!("  {}", item.value));
+                                            }
+                                            ValueDiffKind::Added => {
+                                                ui.label(
+                                                    RichText::new(format!("+ {}", item.value))
+                                                        .monospace()
+                                                        .color(color_added(ui)),
+                                                );
+                                            }
                                         }
                                     }
                                 }

@@ -64,6 +64,7 @@ pub enum BackendEvent {
     },
     Error {
         account_id: String,
+        domain: Option<String>,
         context: String,
         message: String,
     },
@@ -159,6 +160,7 @@ async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -
         Err(err) => {
             return BackendEvent::Error {
                 account_id,
+                domain: None,
                 context: "Connect".to_owned(),
                 message: err.to_string(),
             };
@@ -179,6 +181,7 @@ async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -
         }
         Err(err) => BackendEvent::Error {
             account_id,
+            domain: None,
             context: "Connect".to_owned(),
             message: format_desec_error(&err, None),
         },
@@ -187,7 +190,7 @@ async fn handle_connect(clients: &ClientsMap, account_id: String, token: &str) -
 
 async fn handle_fetch_domains(clients: &ClientsMap, account_id: String) -> BackendEvent {
     let Some(client) = get_client(clients, &account_id).await else {
-        return not_connected_error(account_id, "Fetch domains");
+        return not_connected_error(account_id, None, "Fetch domains");
     };
 
     match fetch_domains(&client).await {
@@ -197,6 +200,7 @@ async fn handle_fetch_domains(clients: &ClientsMap, account_id: String) -> Backe
         },
         Err(err) => BackendEvent::Error {
             account_id,
+            domain: None,
             context: "Fetch domains".to_owned(),
             message: format_desec_error(&err, None),
         },
@@ -210,7 +214,8 @@ async fn handle_fetch_zone(
     minimum_ttl: u32,
 ) -> BackendEvent {
     let Some(client) = get_client(clients, &account_id).await else {
-        return not_connected_error(account_id, &format!("Fetch {domain}"));
+        let context = format!("Fetch {domain}");
+        return not_connected_error(account_id, Some(domain), &context);
     };
 
     match fetch_rrsets(&client, &domain).await {
@@ -223,6 +228,7 @@ async fn handle_fetch_zone(
         Err(err) => BackendEvent::Error {
             account_id,
             context: format!("Fetch {domain}"),
+            domain: Some(domain),
             message: format_desec_error(&err, None),
         },
     }
@@ -236,7 +242,8 @@ async fn handle_apply_changes(
     ops: Vec<DiffOp>,
 ) -> BackendEvent {
     let Some(client) = get_client(clients, &account_id).await else {
-        return not_connected_error(account_id, &format!("Apply {domain}"));
+        let context = format!("Apply {domain}");
+        return not_connected_error(account_id, Some(domain), &context);
     };
 
     let mut patches = Vec::with_capacity(ops.len());
@@ -247,6 +254,7 @@ async fn handle_apply_changes(
                 return BackendEvent::Error {
                     account_id,
                     context: format!("Apply {domain}"),
+                    domain: Some(domain),
                     message,
                 };
             }
@@ -257,6 +265,7 @@ async fn handle_apply_changes(
         return BackendEvent::Error {
             account_id,
             context: format!("Apply {domain}"),
+            domain: Some(domain),
             message: format_desec_error(&err, Some(&ops)),
         };
     }
@@ -273,6 +282,7 @@ async fn handle_apply_changes(
         Err(err) => BackendEvent::Error {
             account_id,
             context: format!("Refresh {domain}"),
+            domain: Some(domain),
             message: format!(
                 "Changes were applied to deSEC, but refreshing failed: {}",
                 format_desec_error(&err, None)
@@ -300,9 +310,14 @@ fn build_bulk_patch(op: &DiffOp) -> Result<BulkPatch, String> {
     Ok(patch)
 }
 
-fn not_connected_error(account_id: String, context: &str) -> BackendEvent {
+fn not_connected_error(
+    account_id: String,
+    domain: Option<String>,
+    context: &str,
+) -> BackendEvent {
     BackendEvent::Error {
         account_id,
+        domain,
         context: context.to_owned(),
         message: "Not connected. Configure an API token first.".to_owned(),
     }
